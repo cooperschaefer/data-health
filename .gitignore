@@ -1,0 +1,21 @@
+# Credentials
+.env
+
+# Generated build artifacts
+dashboard.html
+lambda.zip
+.lambda_pkg/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# Terraform
+infra/.terraform/
+*.tfstate
+*.tfstate.*
+*.tfvars
+crash.log
