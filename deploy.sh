@@ -6,11 +6,11 @@
 # service-account secret at runtime (see infra/secrets.tf).
 set -euo pipefail
 
-# TODO: set this once per project — everything else derives from it.
-# Must match infra/variables.tf's project_slug and infra/main.tf's
-# backend "s3" { key = "<slug>.state" } (that one line can't be
-# parameterized — see the TODO in infra/main.tf).
-PROJECT_SLUG="<slug>"
+# Set once per project — everything else derives from it. Must match
+# infra/variables.tf's project_slug default and infra/main.tf's
+# backend "s3" { key = "data-health.state" } (that one line can't be
+# parameterized — see the comment in infra/main.tf).
+PROJECT_SLUG="data-health"
 
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 INFRA="$ROOT/infra"
@@ -38,7 +38,20 @@ pip install \
 cp -r "$ROOT/api" "$PKGDIR/api"
 
 cd "$PKGDIR"
-zip -r "$ZIP" . -x "*.pyc" -x "*/__pycache__/*" > /dev/null
+if command -v zip > /dev/null; then
+  zip -r "$ZIP" . -x "*.pyc" -x "*/__pycache__/*" > /dev/null
+else
+  # Git Bash on Windows ships without zip — fall back to Python's zipfile
+  python - "$ZIP" <<'PY'
+import os, sys, zipfile
+with zipfile.ZipFile(sys.argv[1], "w", zipfile.ZIP_DEFLATED) as z:
+    for root, dirs, files in os.walk("."):
+        dirs[:] = [d for d in dirs if d != "__pycache__"]
+        for f in files:
+            if not f.endswith(".pyc"):
+                z.write(os.path.join(root, f), os.path.relpath(os.path.join(root, f), "."))
+PY
+fi
 cd "$ROOT"
 rm -rf "$PKGDIR"
 echo "    lambda.zip: $(du -sh "$ZIP" | cut -f1)"

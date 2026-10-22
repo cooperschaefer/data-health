@@ -11,7 +11,11 @@ resource "aws_lambda_function" "api" {
   runtime          = "python3.12"
   handler          = "api.main.handler"
 
-  timeout     = 30
+  # Live /api/data-health/dashboard runs the same ~28 checks as the refresh
+  # (only hit for a non-default ?tmonth= or a cache miss). Matches the /api
+  # origin's origin_read_timeout in cloudfront.tf — CloudFront's max without
+  # a quota increase.
+  timeout     = 60
   memory_size = 512
 
   environment {

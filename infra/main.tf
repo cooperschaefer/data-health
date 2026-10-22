@@ -1,11 +1,10 @@
 terraform {
   backend "s3" {
     bucket = "teg-terraform-states-bucket"
-    # TODO: Terraform's `backend` block can't interpolate variables (it's
-    # evaluated before any variable is resolved), so this literal has to be
-    # set by hand per project — it can't derive from var.project_slug like
-    # everything else in infra/ does.
-    key    = "<slug>.state"
+    # Terraform's `backend` block can't interpolate variables (it's evaluated
+    # before any variable is resolved), so this literal is set by hand — keep
+    # it in sync with project_slug in variables.tf and deploy.sh.
+    key    = "data-health.state"
     region = "us-east-2"
   }
   required_providers {
@@ -45,7 +44,7 @@ data "aws_caller_identity" "current" {}
 # here rather than repeating "tf-${var.project_slug}-..." inline everywhere.
 locals {
   name_prefix           = "tf-${var.project_slug}"
-  bucket_name            = "teg-${var.project_slug}"
-  cloudfront_comment       = "TEG ${var.project_slug} Dashboard"
-  cognito_domain_prefix     = var.cognito_domain_prefix != "" ? var.cognito_domain_prefix : "teg-${var.project_slug}"
+  bucket_name           = "teg-${var.project_slug}"
+  cloudfront_comment    = "TEG ${var.project_slug} Dashboard"
+  cognito_domain_prefix = var.cognito_domain_prefix != "" ? var.cognito_domain_prefix : "teg-${var.project_slug}"
 }

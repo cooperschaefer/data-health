@@ -7,9 +7,9 @@ resource "aws_lambda_function" "refresh" {
   runtime          = "python3.12"
   handler          = "api.refresh.handler"
 
-  # TODO: tune to how expensive get_default_dashboard() actually is —
-  # 300s covers a fleet-wide query comfortably, shrink if this dashboard's
-  # cacheable payload is small.
+  # get_default_dashboard() runs ~28 checks, 8 at a time, plus a possible
+  # warehouse resume. Lambda bills actual runtime, so the headroom is free;
+  # META.total_seconds in the refresh logs shows the real number.
   timeout     = 300
   memory_size = 512
 
@@ -43,13 +43,22 @@ resource "aws_iam_role_policy" "lambda_s3_cache" {
   })
 }
 
-# TODO: pick a schedule that matches how often the underlying data
-# actually changes. 2am CST = 8am UTC is the convention used elsewhere in
-# this project family for a once-daily refresh.
+# Main refresh: ~1.5h after each dbt production run starts, so the cache is
+# rebuilt after the run finishes (runs average ~1h15m; the extra ~15m is
+# buffer for slow runs).
+#
+#   dbt run start (UTC):  10:05  15:05  18:05  21:05  00:05  03:05
+#   cache refresh (UTC):  11:35  16:35  19:35  22:35  01:35  04:35
+#
+# dbt's schedule is fixed in UTC, and EventBridge rule cron expressions are
+# always evaluated in UTC, so this offset holds year-round with no DST
+# handling. Don't convert these to Central time — that would drift by an
+# hour against dbt twice a year. If dbt's schedule changes, update both rows
+# above and the hour list below.
 resource "aws_cloudwatch_event_rule" "refresh" {
   name                = "${local.name_prefix}-refresh"
-  description         = "Refresh the ${var.project_slug} dashboard cache"
-  schedule_expression = "cron(0 8 * * ? *)"
+  description         = "Refresh the ${var.project_slug} dashboard cache ~1.5h after each dbt production run (UTC)"
+  schedule_expression = "cron(35 1,4,11,16,19,22 * * ? *)"
 
   tags = {
     Environment = "production"

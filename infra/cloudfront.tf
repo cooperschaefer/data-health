@@ -20,6 +20,7 @@ resource "aws_cloudfront_distribution" "dashboard" {
       https_port             = 443
       origin_protocol_policy = "https-only"
       origin_ssl_protocols   = ["TLSv1.2"]
+      origin_read_timeout    = 60 # default is 30s; see the API Lambda timeout
     }
   }
 
@@ -90,8 +91,8 @@ resource "aws_cloudfront_key_value_store" "auth" {
 
 resource "aws_cloudfrontkeyvaluestore_key" "client_id" {
   key_value_store_arn = aws_cloudfront_key_value_store.auth.arn
-  key                  = "client_id"
-  value                = aws_cognito_user_pool_client.main.id
+  key                 = "client_id"
+  value               = aws_cognito_user_pool_client.main.id
 }
 
 # CloudFront function: redirect unauthenticated users to Cognito hosted login.
@@ -101,10 +102,10 @@ resource "aws_cloudfrontkeyvaluestore_key" "client_id" {
 #   - redirect_uri   ← derived from the incoming request's Host header, which is
 #                       the CloudFront domain serving this request
 resource "aws_cloudfront_function" "auth" {
-  name        = "${local.name_prefix}-auth"
-  runtime     = "cloudfront-js-2.0"
-  comment     = "Redirect unauthenticated users to Cognito hosted login"
-  publish     = true
+  name                         = "${local.name_prefix}-auth"
+  runtime                      = "cloudfront-js-2.0"
+  comment                      = "Redirect unauthenticated users to Cognito hosted login"
+  publish                      = true
   key_value_store_associations = [aws_cloudfront_key_value_store.auth.arn]
 
   code = <<-EOF
