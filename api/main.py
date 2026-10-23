@@ -34,6 +34,7 @@ import base64
 import json
 import math
 import os
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timedelta
@@ -1901,6 +1902,33 @@ def _cached_payload() -> Optional[bytes]:
         return None
 
 
+# Shared 5-minute result cache, per Lambda container. Every request now
+# carries its own id_token, which is part of CloudFront's /api/* cache key, so
+# CloudFront no longer shares cached answers between users. This takes that
+# role back, and it's safe: it only runs inside routes, after the auth check.
+# Mostly matters for a non-default Targets month (a full ~28-query live run)
+# and saves the S3 read on the default view. Only successful results are
+# cached; None (an S3 miss) is not.
+MEMO_TTL = 300
+_memo_cache: dict[tuple, tuple[float, object]] = {}
+_memo_lock = threading.Lock()
+
+
+def _memo(key: tuple, fn, *args):
+    now = time.monotonic()
+    with _memo_lock:
+        hit = _memo_cache.get(key)
+    if hit and hit[0] > now:
+        return hit[1]
+    value = fn(*args)
+    if value is not None:
+        with _memo_lock:
+            for k in [k for k, (exp, _) in _memo_cache.items() if exp <= now]:
+                del _memo_cache[k]
+            _memo_cache[key] = (now + MEMO_TTL, value)
+    return value
+
+
 # ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
@@ -1925,17 +1953,19 @@ def dashboard_route(target_month: Optional[str] = Query(None, pattern=r"^\d{4}-\
     # The default view is what the refresh Lambda pre-bakes; a non-default
     # Targets month (or ?live=1, or a cache miss) runs the checks live.
     if target_month is None and not live:
-        body = _cached_payload()
+        body = _memo(("s3",), _cached_payload)
         if body is not None:
             # Short: CloudFront's /api/* TTL would otherwise hold it for an hour.
             return Response(content=body, media_type="application/json",
                             headers={"Cache-Control": "max-age=300"})
-    return _guard(get_dashboard, target_month)
+    if live:  # an explicit ?live=1 always runs fresh
+        return _guard(get_dashboard, target_month)
+    return _guard(_memo, ("dashboard", target_month), get_dashboard, target_month)
 
 
 @api.get("/api/data-health/checks/{section}")
 def section_route(section: str, target_month: Optional[str] = Query(None, pattern=r"^\d{4}-\d{2}$")):
-    return _guard(get_section, section, target_month)
+    return _guard(_memo, ("section", section, target_month), get_section, section, target_month)
 
 
 app.include_router(api)
