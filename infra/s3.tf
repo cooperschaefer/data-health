@@ -31,8 +31,12 @@ resource "aws_s3_bucket_policy" "dashboard" {
         Principal = {
           Service = "cloudfront.amazonaws.com"
         }
-        Action   = "s3:GetObject"
-        Resource = "${aws_s3_bucket.dashboard.arn}/*"
+        Action = "s3:GetObject"
+        # The page only. cache/* holds the full payload and must stay out of
+        # CloudFront's reach: the auth function only checks that an id_token
+        # cookie *exists*, so anything CloudFront can serve from this bucket
+        # is effectively public. The API reads cache/* via the Lambda role.
+        Resource = "${aws_s3_bucket.dashboard.arn}/dashboard.html"
         Condition = {
           StringEquals = {
             "AWS:SourceArn" = aws_cloudfront_distribution.dashboard.arn

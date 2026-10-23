@@ -7,6 +7,7 @@ Endpoints:
   GET /health                             → liveness check
   GET /api/data-health/dashboard          → every check, shaped for the page
         ?target_month=YYYY-MM               (Targets tab month; default = next month)
+        ?live=1                             (skip the S3 cache for the default view)
   GET /api/data-health/checks/{section}   → one section's slice of the payload
                                             (debugging / curl; see SECTIONS)
 
@@ -15,8 +16,12 @@ Run locally:  python -m uvicorn api.main:app --reload
 Caching: the payload has no filter parameters that change the SQL (the page's
 concept and heatmap-window filters are applied client-side to data that is
 already network-wide), so api/refresh.py caches the whole default payload to
-S3 and the page reads that; the live route is the dev / non-default-month
-fallback. See CLAUDE.md "Caching strategy".
+S3 and /api/data-health/dashboard serves that; running live is the dev /
+non-default-month / cache-miss fallback. See CLAUDE.md "Caching strategy".
+
+Auth: every /api/* route requires a verified Cognito id_token (see "Auth"
+below). The cache is served through the API, never straight from S3, so it
+sits behind the same check.
 
 The SQL is ported from data_health_checks.sql and was validated against live
 Snowflake as TABLEAU_SVC / PROD_RO. Deviations from that file are commented
@@ -38,7 +43,8 @@ from typing import Optional
 import boto3
 import snowflake.connector
 from cryptography.hazmat.primitives import serialization
-from fastapi import FastAPI, HTTPException, Query
+import jwt
+from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException, Query, Response
 from fastapi.middleware.cors import CORSMiddleware
 from mangum import Mangum
 from snowflake.connector import DictCursor
@@ -1820,8 +1826,87 @@ def get_section(section: str, target_month: Optional[str] = None) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Auth — every /api/* route requires a verified Cognito id_token.
+#
+# The CloudFront Function only gates the page (and only checks that an
+# id_token cookie exists), lets /api/* through, and the Lambda Function URL is
+# authorization_type NONE. So without this check anyone with the URL could
+# read the whole payload. The page sends the token as
+# `Authorization: Bearer <id_token>` (CloudFront forwards that header on
+# /api/*). Same approach as auto-payroll-recon and nps-tracker.
+#
+# Config (set by Terraform on the Lambda):
+#   COGNITO_USER_POOL_ID  the shared TEG pool (Google Workspace SSO)
+#   COGNITO_CLIENT_ID     optional; when set, the token audience must match.
+#                         Issuer + signature already pin tokens to the TEG pool.
+#
+# Fails closed: inside Lambda, a missing pool id is a 503, never an open door.
+# Outside Lambda with no pool configured (local dev), auth is skipped.
+# ---------------------------------------------------------------------------
+
+COGNITO_USER_POOL_ID = os.environ.get("COGNITO_USER_POOL_ID")
+COGNITO_CLIENT_ID = os.environ.get("COGNITO_CLIENT_ID")
+_IN_LAMBDA = bool(os.environ.get("AWS_LAMBDA_FUNCTION_NAME"))
+_jwks_client: Optional[jwt.PyJWKClient] = None
+
+
+def _issuer() -> str:
+    region = COGNITO_USER_POOL_ID.split("_", 1)[0]
+    return f"https://cognito-idp.{region}.amazonaws.com/{COGNITO_USER_POOL_ID}"
+
+
+def _require_user(authorization: Optional[str] = Header(None)) -> dict:
+    global _jwks_client
+    if not COGNITO_USER_POOL_ID:
+        if _IN_LAMBDA:
+            raise HTTPException(status_code=503, detail="Auth is not configured on this deployment")
+        return {"email": "local-dev"}
+    if not authorization or not authorization.lower().startswith("bearer "):
+        raise HTTPException(status_code=401, detail="Sign in required")
+    token = authorization[7:].strip()
+    try:
+        if _jwks_client is None:
+            _jwks_client = jwt.PyJWKClient(_issuer() + "/.well-known/jwks.json", cache_keys=True)
+        key = _jwks_client.get_signing_key_from_jwt(token).key
+        claims = jwt.decode(
+            token, key, algorithms=["RS256"], issuer=_issuer(),
+            audience=COGNITO_CLIENT_ID, options={"verify_aud": bool(COGNITO_CLIENT_ID), "require": ["exp", "iat"]},
+        )
+    except jwt.PyJWTError:
+        raise HTTPException(status_code=401, detail="Sign-in expired or invalid")
+    if claims.get("token_use") != "id":
+        raise HTTPException(status_code=401, detail="Sign-in expired or invalid")
+    return claims
+
+
+# ---------------------------------------------------------------------------
+# Cached payload — read from S3 here, behind auth, instead of the page
+# fetching /cache/data-health.json straight through CloudFront (that path is
+# outside the auth gate). CACHE_BUCKET is unset in local dev → always live.
+# ---------------------------------------------------------------------------
+
+CACHE_BUCKET = os.environ.get("CACHE_BUCKET")
+CACHE_KEY = "cache/data-health.json"  # what api/refresh.py writes
+
+
+def _cached_payload() -> Optional[bytes]:
+    if not CACHE_BUCKET:
+        return None
+    try:
+        obj = boto3.client("s3", region_name=os.environ.get("AWS_REGION_NAME", "us-east-2")) \
+            .get_object(Bucket=CACHE_BUCKET, Key=CACHE_KEY)
+        return obj["Body"].read()
+    except Exception as exc:
+        print(f"Cache read failed, running live: {exc}")
+        return None
+
+
+# ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
+
+api = APIRouter(dependencies=[Depends(_require_user)])
+
 
 def _guard(fn, *args):
     try:
@@ -1834,14 +1919,26 @@ def _guard(fn, *args):
         raise HTTPException(status_code=500, detail=f"Query failed: {exc}")
 
 
-@app.get("/api/data-health/dashboard")
-def dashboard_route(target_month: Optional[str] = Query(None, pattern=r"^\d{4}-\d{2}$")):
+@api.get("/api/data-health/dashboard")
+def dashboard_route(target_month: Optional[str] = Query(None, pattern=r"^\d{4}-\d{2}$"),
+                    live: bool = Query(False)):
+    # The default view is what the refresh Lambda pre-bakes; a non-default
+    # Targets month (or ?live=1, or a cache miss) runs the checks live.
+    if target_month is None and not live:
+        body = _cached_payload()
+        if body is not None:
+            # Short: CloudFront's /api/* TTL would otherwise hold it for an hour.
+            return Response(content=body, media_type="application/json",
+                            headers={"Cache-Control": "max-age=300"})
     return _guard(get_dashboard, target_month)
 
 
-@app.get("/api/data-health/checks/{section}")
+@api.get("/api/data-health/checks/{section}")
 def section_route(section: str, target_month: Optional[str] = Query(None, pattern=r"^\d{4}-\d{2}$")):
     return _guard(get_section, section, target_month)
+
+
+app.include_router(api)
 
 
 # ---------------------------------------------------------------------------

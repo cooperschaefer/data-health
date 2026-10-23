@@ -43,8 +43,7 @@ data "aws_caller_identity" "current" {}
 # that turns on the "just set project_slug" workflow. Add derived locals
 # here rather than repeating "tf-${var.project_slug}-..." inline everywhere.
 locals {
-  name_prefix           = "tf-${var.project_slug}"
-  bucket_name           = "teg-${var.project_slug}"
-  cloudfront_comment    = "TEG ${var.project_slug} Dashboard"
-  cognito_domain_prefix = var.cognito_domain_prefix != "" ? var.cognito_domain_prefix : "teg-${var.project_slug}"
+  name_prefix        = "tf-${var.project_slug}"
+  bucket_name        = "teg-${var.project_slug}"
+  cloudfront_comment = "TEG ${var.project_slug} Dashboard"
 }

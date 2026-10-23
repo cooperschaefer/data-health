@@ -10,8 +10,10 @@ loudly if an anchor isn't found instead of silently shipping stale JS — so a
 design edit to the mockup that moves an anchor breaks the build, not the page.
 
 Data flow on the built page:
-  prod      → /cache/data-health.json (refresh Lambda), falling back to the
-              live API if the cache is missing or unreadable
+  prod      → /api/data-health/dashboard with the id_token as a Bearer
+              header; the API serves the refresh Lambda's S3 cache, or runs
+              live if the cache is missing or unreadable. Never /cache/*
+              directly: that path is outside the sign-in gate.
   ?tmonth=  → live API with that Targets month (not cached)
   local dev → http://localhost:8000/api/data-health/dashboard
               (override the API origin with ?api=http://127.0.0.1:8001)
@@ -46,11 +48,11 @@ DEST = Path(__file__).parent / "dashboard.html"
 # login. redirect_uri must match the CloudFront function exactly:
 # window.location.origin (no trailing slash).
 #
-# COGNITO_CLIENT is a placeholder until the first `terraform apply` — copy
-# the real value from `terraform output cognito_client_id` once the Cognito
-# resources exist, then rebuild. This is a two-pass deploy; see CLAUDE.md.
-COGNITO_DOMAIN = "https://teg-data-health.auth.us-east-2.amazoncognito.com"
-COGNITO_CLIENT = "REPLACE_AFTER_TERRAFORM_APPLY"
+# Shared TEG pool (Google Workspace SSO), see infra/cognito.tf. COGNITO_CLIENT
+# is this dashboard's app client on that pool (`terraform output
+# cognito_client_id`); it only changes if the client is ever recreated.
+COGNITO_DOMAIN = "https://teg-dashboards.auth.us-east-2.amazoncognito.com"
+COGNITO_CLIENT = "33inu5tngqgn4n878ghm9avd2u"
 
 AUTH_SCRIPT = f"""\
 <script>
@@ -90,8 +92,12 @@ async function _handleAuth() {{
 
   const hasCookie = document.cookie.split(';').some(c => c.trim().startsWith('id_token='));
   if (!hasCookie) {{
-    window.location.href = COGNITO_DOMAIN + '/login?client_id=' + COGNITO_CLIENT +
-      '&response_type=code&scope=openid+email+profile' +
+    // Match the CloudFront function: /oauth2/authorize + identity_provider=Google
+    // so the shared-pool viewer is sent straight to Google (silent SSO), not the
+    // hosted-UI chooser. This path only fires if CloudFront let the request
+    // through (e.g. a cookie expired client-side mid-session).
+    window.location.href = COGNITO_DOMAIN + '/oauth2/authorize?client_id=' + COGNITO_CLIENT +
+      '&response_type=code&scope=openid+email+profile&identity_provider=Google' +
       '&redirect_uri=' + encodeURIComponent(COGNITO_REDIRECT);
     return false;  // navigating away
   }}
@@ -387,33 +393,54 @@ function _setDetail(msg, isError){
 }
 function _hideOverlay(){ const el = document.getElementById('_api-loader'); if (el) el.remove(); }
 
+// Auth ───────────────────────────────────────────────────────────────────────
+// Every /api call carries the Cognito id_token; the API rejects anything else.
+// Local dev has no token and the API skips the check.
+function _authHeaders(){
+  const m = document.cookie.match(/(?:^|;\s*)id_token=([^;]+)/);
+  return m ? { Authorization: 'Bearer ' + m[1] } : {};
+}
+// Token rejected (expired, or a cookie that outlived it): drop the cookie and
+// reload, which sends the browser back through sign-in. At most once a minute,
+// so a misconfigured API shows an error instead of reload-looping.
+function _reauthenticate(){
+  let last = 0;
+  try { last = Number(sessionStorage.getItem('dhReauthAt')) || 0; } catch (_) {}
+  if (Date.now() - last < 60000) {
+    _showOverlay('Could not load the data health checks');
+    _setDetail('Your sign-in was not accepted. Reload the page to try again.', true);
+    return;
+  }
+  try { sessionStorage.setItem('dhReauthAt', String(Date.now())); } catch (_) {}
+  document.cookie = 'id_token=; path=/; max-age=0; SameSite=Lax';
+  location.reload();
+}
+
 // Boot ───────────────────────────────────────────────────────────────────────
 async function initDashboard(){
   _showOverlay('Loading data health checks…');
   const tmonth = new URLSearchParams(location.search).get('tmonth');
-  const live = API_BASE + '/api/data-health/dashboard' + (tmonth ? '?target_month=' + encodeURIComponent(tmonth) : '');
-  // prod reads the pre-baked cache first; a non-default month or local dev goes straight to the API
-  const urls = (_isLocalDev() || tmonth) ? [live] : ['/cache/data-health.json', live];
-  const errors = [];
-  let data = null;
-  for (const url of urls) {
-    try {
-      _setDetail(url === live ? 'Running the checks against Snowflake (this can take 20-30 seconds)…' : 'Reading the latest cached results…');
-      const res = await fetch(url, {cache: 'no-cache'});
-      if (!res.ok) {
-        let detail = ''; try { detail = (await res.json()).detail || ''; } catch (_) {}
-        throw new Error(`${url} returned HTTP ${res.status}${detail ? ': ' + detail : ''}`);
-      }
-      data = await res.json();
-      break;
-    } catch (err) {
-      console.error('[initDashboard]', err);
-      errors.push(err.message);
+  const url = API_BASE + '/api/data-health/dashboard' + (tmonth ? '?target_month=' + encodeURIComponent(tmonth) : '');
+  // The API serves the pre-baked cache for the default view (behind the same
+  // sign-in check as everything else) and only runs the checks live for a
+  // non-default month, a cache miss, or local dev.
+  let data = null, error = '';
+  try {
+    _setDetail(tmonth || _isLocalDev() ? 'Running the checks against Snowflake (this can take 20-30 seconds)…' : 'Reading the latest results…');
+    const res = await fetch(url, {cache: 'no-cache', headers: _authHeaders()});
+    if (res.status === 401) { _reauthenticate(); return; }
+    if (!res.ok) {
+      let detail = ''; try { detail = (await res.json()).detail || ''; } catch (_) {}
+      throw new Error(`${url} returned HTTP ${res.status}${detail ? ': ' + detail : ''}`);
     }
+    data = await res.json();
+  } catch (err) {
+    console.error('[initDashboard]', err);
+    error = err.message;
   }
   if (!data) {
     _showOverlay('Could not load the data health checks');
-    _setDetail(errors.join(' | ') + (_isLocalDev() ? ' — is the API running? (python -m uvicorn api.main:app --reload)' : ''), true);
+    _setDetail(error + (_isLocalDev() ? ' — is the API running? (python -m uvicorn api.main:app --reload)' : ''), true);
     return;
   }
   try {
@@ -665,7 +692,7 @@ def main() -> None:
     if "</body>" not in html:
         sys.exit("ERROR: could not find </body> — is this the right source file?")
     html = html.replace("</body>", LIVE_SCRIPT + "\n" + AUTH_SCRIPT + "\n</body>", 1)
-    steps.append("Injected:  live loader (cache → API fallback, visible errors) + initDashboard()")
+    steps.append("Injected:  live loader (authenticated API, cache served by the API, visible errors) + initDashboard()")
     steps.append("Injected:  Cognito auth-gate script before </body>")
 
     leftovers = [s for s in ("mulberry(si", "const ATTN = [", "TG_EXCEPT", "Fifteen things", "NEWSTORES.has") if s in html]
@@ -688,10 +715,11 @@ def main() -> None:
     print("  2. pip install -r requirements.txt")
     print("  3. python -m uvicorn api.main:app --reload")
     print(f"  4. python -m http.server 8080, then open http://127.0.0.1:8080/{DEST.name}")
-    print()
-    print("  After the first `terraform apply`, copy the real Cognito client id from")
-    print("  `terraform output cognito_client_id` into COGNITO_CLIENT at the top of")
-    print("  this script and rebuild.")
+    if COGNITO_CLIENT.startswith("REPLACE"):
+        print()
+        print("  After the first `terraform apply`, copy the real Cognito client id from")
+        print("  `terraform output cognito_client_id` into COGNITO_CLIENT at the top of")
+        print("  this script and rebuild.")
 
 
 if __name__ == "__main__":

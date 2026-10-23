@@ -22,12 +22,20 @@ resource "aws_lambda_function" "api" {
     variables = {
       SNOWFLAKE_SECRET_ARN = data.aws_secretsmanager_secret.snowflake.arn
       AWS_REGION_NAME      = var.aws_region
+      # The API verifies the Cognito id_token on every /api/* request against
+      # this pool, and fails closed (503) if it's missing. The app client id is
+      # deliberately not passed (lambda -> client -> distribution -> function
+      # url -> lambda would be a cycle); issuer + signature pin the pool.
+      COGNITO_USER_POOL_ID = var.shared_cognito_pool_id
+      # The API serves the refresh Lambda's cache from here, behind auth
+      CACHE_BUCKET = local.bucket_name
     }
   }
 }
 
-# Auth is enforced entirely at the CloudFront layer (see cloudfront.tf's
-# CloudFront Function) — this Function URL is intentionally open.
+# This Function URL is open at the network level. That's safe only because
+# the API itself verifies the Cognito id_token on every /api/* route (see
+# api/main.py "Auth") — the CloudFront Function just checks a cookie exists.
 resource "aws_lambda_function_url" "api" {
   function_name      = aws_lambda_function.api.function_name
   authorization_type = "NONE"

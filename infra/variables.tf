@@ -16,8 +16,14 @@ variable "snowflake_secret_name" {
   default     = "tf-teg-production-snowflake-tableau_svc-creds"
 }
 
-variable "cognito_domain_prefix" {
-  description = "Unique prefix for the Cognito hosted UI domain. Cognito domains are globally unique across ALL AWS accounts, not just yours — leave empty to default to \"teg-$${project_slug}\", and only override if that collides."
+variable "shared_cognito_pool_id" {
+  description = "Shared TEG Cognito user pool (Google Workspace SSO) that all dashboards federate through"
   type        = string
-  default     = ""
+  default     = "us-east-2_IKqlKW1Uu"
+}
+
+variable "shared_cognito_domain" {
+  description = "Hosted-UI domain of the shared TEG Cognito pool"
+  type        = string
+  default     = "teg-dashboards.auth.us-east-2.amazoncognito.com"
 }

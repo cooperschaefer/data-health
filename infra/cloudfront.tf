@@ -111,18 +111,21 @@ resource "aws_cloudfront_function" "auth" {
   code = <<-EOF
     import cf from 'cloudfront';
 
-    const COGNITO_URL = 'https://${local.cognito_domain_prefix}.auth.${var.aws_region}.amazoncognito.com';
+    const COGNITO_URL = 'https://${var.shared_cognito_domain}';
     const kvs = cf.kvs();
 
     async function handler(event) {
       const request = event.request;
       const cookies  = request.cookies || {};
 
-      // Allow /api/*, /health, and /cache/* through unauthenticated — the
-      // page's own JS calls these directly via fetch, which can't follow a
-      // 302-to-login redirect the way a top-level navigation can. Forgetting
-      // /cache/* here breaks the pre-baked-cache fetch on first paint.
-      if (request.uri.startsWith('/api/') || request.uri === '/health' || request.uri.startsWith('/cache/')) {
+      // Allow /api/* and /health through — the page's own JS calls the API
+      // via fetch, which can't follow a 302-to-login redirect the way a
+      // top-level navigation can. This is NOT where the API is protected:
+      // this function only checks that an id_token cookie exists. The API
+      // verifies the token itself on every request (api/main.py "Auth").
+      // /cache/* is deliberately not here any more: the page reads the cache
+      // through the API, and s3.tf only lets CloudFront fetch dashboard.html.
+      if (request.uri.startsWith('/api/') || request.uri === '/health') {
         return request;
       }
 
@@ -144,8 +147,8 @@ resource "aws_cloudfront_function" "auth" {
           statusDescription: 'Found',
           headers: {
             location: {
-              value: COGNITO_URL + '/login?client_id=' + clientId +
-                     '&response_type=code&scope=openid+email+profile' +
+              value: COGNITO_URL + '/oauth2/authorize?client_id=' + clientId +
+                     '&response_type=code&scope=openid+email+profile&identity_provider=Google' +
                      '&redirect_uri=https://' + host
             }
           }

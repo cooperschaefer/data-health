@@ -1,7 +1,8 @@
 """
 Cache refresh Lambda — runs on schedule (see infra/refresh.tf).
-Pre-bakes the whole Data Health payload so prod page loads read S3 through
-CloudFront instead of running ~28 Snowflake queries per visit.
+Pre-bakes the whole Data Health payload so prod page loads read S3 (via the
+authenticated /api/data-health/dashboard route, never /cache/* directly)
+instead of running ~28 Snowflake queries per visit.
 
 Caching strategy (CLAUDE.md "Caching strategy"): whole-payload cache. The
 page's concept and heatmap-window filters are applied client-side to data
@@ -30,7 +31,7 @@ def write(key: str, data, max_age: int = 300):
         Body=json.dumps(data, default=str, allow_nan=False),
         ContentType="application/json",
         # Short: a health dashboard that serves an hour-old "everything is
-        # fine" defeats the point. CloudFront's /cache/* TTL caps this anyway.
+        # fine" defeats the point. The API re-serves it with max-age=300 too.
         CacheControl=f"max-age={max_age}",
     )
 

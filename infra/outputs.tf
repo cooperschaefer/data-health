@@ -9,8 +9,8 @@ output "api_url" {
 }
 
 output "cognito_login_url" {
-  description = "Cognito hosted login UI"
-  value       = "https://${local.cognito_domain_prefix}.auth.${var.aws_region}.amazoncognito.com/login?client_id=${aws_cognito_user_pool_client.main.id}&response_type=code&scope=openid+email+profile&redirect_uri=https://${aws_cloudfront_distribution.dashboard.domain_name}"
+  description = "Cognito hosted login (shared TEG pool, straight to Google SSO)"
+  value       = "https://${var.shared_cognito_domain}/oauth2/authorize?client_id=${aws_cognito_user_pool_client.main.id}&response_type=code&scope=openid+email+profile&identity_provider=Google&redirect_uri=https://${aws_cloudfront_distribution.dashboard.domain_name}"
 }
 
 output "cognito_client_id" {
