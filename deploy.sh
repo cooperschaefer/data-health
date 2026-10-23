@@ -18,15 +18,21 @@ ZIP="$ROOT/lambda.zip"
 SITE_BUCKET="teg-${PROJECT_SLUG}"
 CLOUDFRONT_COMMENT="TEG ${PROJECT_SLUG} Dashboard"
 
+# Use the Lambda target runtime (3.12) explicitly. On Windows the system
+# `python` is often 3.14, whose pip crashes on the cross-platform wheel build
+# below (AttributeError: 'tuple' object has no attribute 'isdisjoint'). PY must
+# therefore be a 3.12 interpreter for both the build and the pip install.
+PY="py -3.12"
+
 echo "==> Building dashboard.html..."
-python "$ROOT/build_dashboard.py"
+$PY "$ROOT/build_dashboard.py"
 
 echo "==> Building Lambda zip..."
 rm -f "$ZIP"
 
 PKGDIR="$ROOT/.lambda_pkg"
 rm -rf "$PKGDIR"
-pip install \
+$PY -m pip install \
   --quiet \
   --target "$PKGDIR" \
   --platform manylinux2014_x86_64 \
