@@ -863,3 +863,59 @@ FROM latest l JOIN m ON m.sheet = l.sheet AND m.mth = l.latest_month ORDER BY l.
 --     ADP_DATA_IMPORT (ends Sep 2024), and REPORTING.GM_STRETCH_GOAL (last Jan 2026; the aggregate column is 0 for every store).
 --   * Resova sales sheet (STG_GOOGLE_DRIVE__RESOVA_DATA_RESOVA_SALES): latest sale date per store. Most stores stopped when they
 --     moved to Xola, so only alert for stores that are still on Resova.
+
+
+-- -----------------------------------------------------------------------------
+-- CHECK 20: 3RD-PARTY BOOKINGS WITH NO RATE IN THE 3RD PARTY INFO TAB  (2024 LBS Keys)
+-- Catches: a store selling through a partner (Viator, Groupon, Funex, MOA bundle...) whose row in the 3rd Party Info tab
+-- has no rate for that program, so dbt never swaps in the partner rate and the booking keeps what the guest paid (often
+-- full price, or $0 when the voucher is entered as a 100% discount). Found 2026-10-23: no GBGS row has a Viator or
+-- MOA bundle rate, though seven GBGS stores took ~1,700 MOA bundle bookings in the past year.
+-- How it works: the tab's first data row (_LINE 1) holds the Xola tag for each program column. A booking with one of those
+-- tags and IS_THIRD_PARTY = 0 didn't match a rate; dbt sets IS_THIRD_PARTY = 1 on every booking it did (verified across
+-- all matched tags). Tags match case- and space-insensitively, as in dbt (bookings carry them upper-cased).
+-- Store join: STORE_ID = DIM_STORES_ID, the same as _AGG_BOOKINGS_DAY (not REVENUE_STORE_ID; the two differ only for ~1,300
+-- Remote Adventures bookings a year, none 3rd party, checked 2026-10-23). Zone is DIM_STORES_MASTER._ZONE_2026.
+-- Limits: a brand-new partner tag that isn't in the tab's tag row at all can't be seen here. Resova bookings (GBGS stores
+-- until about March 2026) carry made-up tag lists, so treat Resova rows with suspicion.
+-- Lookback: 90 days by default; the dashboard lets you pick up to 365 (the API's tp_days parameter).
+-- Visual: "Sheet upkeep" tab, 3rd-party rates panel, plus the "3rd-party rates missing" Data Central tile.
+-- -----------------------------------------------------------------------------
+WITH scope_stores AS (
+    SELECT DIM_STORES_MASTER_ID, MAX(LBS_NAME) AS LBS_NAME, MAX(CONCEPT) AS CONCEPT, MAX(TICKER_FIN) AS TICKER_FIN
+    FROM TEG_PROD.DW.AGG_STORES_DAY
+    WHERE STORE_STATUS IN ('Mature','Ramping','New') AND CONCEPT IN ('TEG','GBGS') AND COALESCE(TEG_TICKER,'') NOT IN ('RA','TBH','UFT')
+      AND LBS_NAME NOT IN ('Remote Adventures','Team Building Hub')
+    GROUP BY 1
+), sheet AS (
+    SELECT _LINE AS line, UPPER(TRIM(TICKER_FIN)) AS tk, OBJECT_CONSTRUCT_KEEP_NULL(*) AS o
+    FROM TEG_PROD.STAGE.STG_GOOGLE_DRIVE___2024_LBS_KEYS_3_RD_PARTY_INFO
+), tag_cols AS (   -- program column -> Xola tag, from the tab's tag row
+    SELECT UPPER(TRIM(f.value::STRING)) AS tag, MIN(f.key) AS col
+    FROM sheet, LATERAL FLATTEN(input => o) f
+    WHERE line = 1 AND f.key NOT IN ('_LINE','_FIVETRAN_SYNCED','PROGRAM_NAME','TICKER_FIN','TEG_RETAIL_RATE','TEG_RACK_RATE')
+      AND NULLIF(TRIM(f.value::STRING),'') IS NOT NULL
+    GROUP BY 1
+), sheet_rows AS (
+    SELECT tk, MIN(line) AS line FROM sheet WHERE line > 1 GROUP BY 1
+), bk AS (
+    SELECT DISTINCT b.ID, s.LBS_NAME, s.CONCEPT, s.TICKER_FIN, d._ZONE_2026 AS ZONE, t.tag, t.col, b.AMOUNT_PAID, b.DISCOUNT_AMOUNT, b.ARRIVAL_DATE
+    FROM TEG_PROD.DW.FCT_OPS_BOOKINGS_ADJUSTMENTS b
+    JOIN TEG_PROD.DW.DIM_STORES_MASTER d ON d.DIM_STORES_ID = b.STORE_ID
+    JOIN scope_stores s ON s.DIM_STORES_MASTER_ID = d.ID,
+         LATERAL FLATTEN(input => b.TAGS_ARRAY) f
+    JOIN tag_cols t ON t.tag = UPPER(TRIM(f.value::STRING))
+    WHERE b.ARRIVAL_DATE >= DATEADD(day, -90, CURRENT_DATE) AND b.ARRIVAL_DATE < CURRENT_DATE
+      AND COALESCE(b.IS_THIRD_PARTY, 0) = 0
+      AND COALESCE(b.IS_DEMO_TRAINING, 0) = 0
+      AND COALESCE(b.BOOKING_STATUS, '') <> '700'   -- cancelled
+)
+SELECT bk.LBS_NAME AS store, bk.CONCEPT AS concept, bk.ZONE AS zone, bk.TICKER_FIN AS ticker, bk.tag,
+       INITCAP(REPLACE(TRIM(bk.col, '_'), '_', ' ')) AS sheet_column,
+       r.line + 2 AS sheet_row,   -- matches the sheet: ALX is _LINE 2 and sheet row 4
+       COUNT(*) AS bookings, COUNT_IF(bk.AMOUNT_PAID = 0) AS fully_discounted,
+       COUNT_IF(bk.AMOUNT_PAID > 0 AND COALESCE(bk.DISCOUNT_AMOUNT, 0) = 0) AS full_price,
+       ROUND(SUM(bk.AMOUNT_PAID), 2) AS paid, MIN(bk.ARRIVAL_DATE)::DATE AS first_seen, MAX(bk.ARRIVAL_DATE)::DATE AS last_seen
+FROM bk LEFT JOIN sheet_rows r ON r.tk = UPPER(TRIM(bk.TICKER_FIN))
+GROUP BY 1, 2, 3, 4, 5, 6, 7
+ORDER BY bookings DESC, store;

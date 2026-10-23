@@ -15,6 +15,9 @@ Data flow on the built page:
               live if the cache is missing or unreadable. Never /cache/*
               directly: that path is outside the sign-in gate.
   ?tmonth=  → live API with that Targets month (not cached)
+  ?tpdays=  → after the default load, the 3rd-party rates panel re-runs
+              /api/data-health/checks/third_party?tp_days=N (the picker
+              in that panel does the same and keeps this param in step)
   local dev → http://localhost:8000/api/data-health/dashboard
               (override the API origin with ?api=http://127.0.0.1:8001)
 
@@ -256,6 +259,7 @@ function _applyPayload(d){
   NET = d.NET; RECON = d.RECON; REV = d.REV; UNMAPPED = d.UNMAPPED;
   TTYPES = d.TTYPES; TG = d.TG; ORPHAN_T = d.ORPHAN_T; SG = d.SG;
   SLOT_ISSUES = d.SLOT_ISSUES; SLOT_MISMATCH = d.SLOT_MISMATCH; SHEET_COV = d.SHEET_COV; SHEET_COV_CLEAN = d.SHEET_COV_CLEAN; MONTHLY = d.MONTHLY;
+  TP = d.TP;
 }
 
 function renderStatic(){
@@ -288,10 +292,8 @@ function renderStatic(){
     + _kpi(U.stores.length, `Store${U.stores.length === 1 ? '' : 's'} with unknown revenue &gt; $0` + (U.stores.length ? ': ' + U.stores.slice(0,3).map(x => _e(x.store) + ' ' + _usd(x.rev)).join(', ') : ''));
 
   // NPS tab
-  $('#npsUnmTbl').innerHTML = D.NPS_UNMAPPED.length ? D.NPS_UNMAPPED.map(r => {
-      const isNull = r.loc === '(null)' && r.gbgs_loc === '(null)';
-      return `<tr><td>${_e(r.source)}</td><td>${_e(r.loc)}</td><td>${_e(r.gbgs_loc)}</td><td>${isNull ? `<span class="chip YELLOW">${r.responses}</span>` : r.responses}</td><td>${r.first_seen}</td><td>${r.last_seen}</td></tr>`; }).join('')
-    : '<tr><td colspan="6" class="hintcell">Every NPS response in the last 30 days has a store.</td></tr>';
+  NPS_UNM = D.NPS_UNMAPPED.map(r => ({...r, items: r.items || []})); npsSel = -1;
+  renderNpsUnmapped();
   $('#npsNone').innerHTML = D.NPS_NONE.length
     ? `<div class="tbl-wrap"><table><thead><tr><th>Store</th><th>Concept</th><th>Bookings (14 days)</th><th>NPS responses (30 days)</th></tr></thead><tbody>${D.NPS_NONE.map(r => `<tr><td>${_e(r.store)}</td><td>${r.concept}</td><td>${r.bookings_14d}</td><td><span class="chip YELLOW">0</span></td></tr>`).join('')}</tbody></table></div>`
     : '<div class="note" style="margin:0">No stores flagged.' + (D.NO_BOOKINGS.length ? ` (${D.NO_BOOKINGS.length} active store${D.NO_BOOKINGS.length>1?'s have':' has'} no bookings at all in 14 days: ${D.NO_BOOKINGS.map(r => _e(r.store)).join(', ')}.)` : '') + '</div>';
@@ -372,6 +374,36 @@ function renderAll(){
     : '<tr><td colspan="2" class="hintcell">Every target row uses a ticker that is in dim_stores_master.</td></tr>';
   renderSuggestions();
   renderUpkeep();
+  renderThirdParty();
+}
+
+// 3rd-party rates lookback (Check 20). The payload carries the 90-day
+// default; any other window re-runs just that check live. A failure keeps
+// the table that's showing and says so in the panel.
+async function loadThirdParty(days){
+  const sel = $('#tpDays');
+  sel.disabled = true;
+  $('#tpStatus').textContent = `Checking the last ${days === 365 ? 'year' : days + ' days'}…`;
+  try {
+    const url = API_BASE + '/api/data-health/checks/third_party?tp_days=' + days;
+    const res = await fetch(url, {cache: 'no-cache', headers: _authHeaders()});
+    if (res.status === 401) { _reauthenticate(); return; }
+    if (!res.ok) {
+      let detail = ''; try { detail = (await res.json()).detail || ''; } catch (_) {}
+      throw new Error(`HTTP ${res.status}${detail ? ': ' + detail : ''}`);
+    }
+    TP = (await res.json()).TP;
+    const q = new URLSearchParams(location.search);
+    if (TP.days === TP.default) q.delete('tpdays'); else q.set('tpdays', TP.days);
+    history.replaceState(null, '', location.pathname + (q.toString() ? '?' + q.toString() : ''));
+    renderThirdParty();
+  } catch (err) {
+    console.error('[loadThirdParty]', err);
+    sel.value = String(TP.days);
+    $('#tpStatus').innerHTML = `<span style="color:var(--red)">Could not load ${days} days (${_e(err.message)}). Still showing ${TP.days} days.</span>`;
+  } finally {
+    sel.disabled = false;
+  }
 }
 
 // Loading overlay ────────────────────────────────────────────────────────────
@@ -448,6 +480,8 @@ async function initDashboard(){
     renderAll();
     initDataCentral();
     _hideOverlay();
+    const tpd = +new URLSearchParams(location.search).get('tpdays');
+    if (tpd && tpd !== TP.days && [...$('#tpDays').options].some(o => +o.value === tpd)) loadThirdParty(tpd);
   } catch (err) {
     console.error('[initDashboard] render', err);
     _showOverlay('The dashboard could not render this data');
@@ -488,6 +522,9 @@ DC_TILES_LIVE = r"""  // ---- numbers computed from the same data the dashboard 
   const nullLoc = D.NPS_NULL_LOC, npsN = D.NPS_UNMAPPED_N;
   const plural = (n, w) => `${n} ${w}${n === 1 ? '' : 's'}`;
   const days = TG_.days_to > 0 ? `${TG_.short} 1 is ${TG_.days_to} day${TG_.days_to === 1 ? '' : 's'} away` : `${TG_.label} has started`;
+  const tpZero = TP.rows.reduce((a,r) => a + r.fully_discounted, 0), tpFull = TP.rows.reduce((a,r) => a + r.full_price, 0);
+  const tpByProg = {}; TP.rows.forEach(r => tpByProg[r.sheet_column] = (tpByProg[r.sheet_column] || 0) + r.bookings);
+  const tpTop = Object.keys(tpByProg).sort((a,b) => tpByProg[b] - tpByProg[a]);
 
   // tab = which tab opens; at = panel heading prefix (or #id) to scroll to
   const sgc = {xola:0, pattern:0, confirm:0}; if (SG) Object.values(SG.sug).forEach(x => sgc[x.c]++);
@@ -512,7 +549,8 @@ DC_TILES_LIVE = r"""  // ---- numbers computed from the same data the dashboard 
     {cat:`Targets (${TG_.label.split(' ')[0]})`, title:'Unrecognised target tickers', s:'INFO', num:String(ORPHAN_T.length), unit:"tickers that aren't stores", viz:'<span class="dc-viz"></span>', detail:ORPHAN_T.length ? 'Placeholders such as ' + ORPHAN_T.slice(0,2).map(r => r[0]).join(', ') + ', or stores not yet open' : 'Every target ticker is a store', tab:'targets', at:'Target rows under a ticker', dest:'Targets'},
     {cat:'Sheet upkeep', title:'Slots upkeep', s:D.SLOT_S, num:String(SLOT_ISSUES.length), unit:'open stores show 0 slots', viz:SLOT_ISSUES.length ? bar([slotKinds('missing') + slotKinds('named') + slotKinds('blank'),'RED'],[slotKinds('unpicked'),'ORANGE']) : check, detail:`${slotKinds('missing') + slotKinds('named') + slotKinds('blank')} missing from the sheet, ${slotKinds('unpicked')} the aggregate is not picking up. ${SLOT_MISMATCH.length} more where Team Info disagrees`, tab:'upkeep', at:'Slots upkeep', dest:'Sheet upkeep'},
     {cat:'Sheet upkeep', title:'Stores missing from sheets', s:covStores.length ? 'YELLOW' : 'GREEN', num:String(covStores.length), unit:'stores missing from at least one sheet', viz:segs(SHEET_COV.map(x => 'YELLOW').concat(SHEET_COV_CLEAN.map(x => 'GREEN'))), detail:`${SHEET_COV.reduce((a,x) => a + x.missing.length, 0)} gaps across ${SHEET_COV.length} of ${SHEET_COV.length + SHEET_COV_CLEAN.length} sheets.` + (covWorst.length ? ' Worst: ' + covWorst.slice(0,3).map(x => x.n).join(', ') : ''), tab:'upkeep', at:'New-store checklist', dest:'Sheet upkeep'},
-    {cat:'Sheet upkeep', title:'Monthly sheets behind', s:behind.length ? 'YELLOW' : 'GREEN', num:String(behind.length), unit:'monthly sheets behind where they should be', viz:segs(MONTHLY.map(x => x.s === 'INFO' ? 'GREY' : x.s)), detail:behind.length ? behind.slice(0,3).map(x => `${x.sheet} (${x.latest})`).join(', ') : 'Every sheet is where it should be', tab:'upkeep', at:'Month-by-month sheets', dest:'Sheet upkeep'}
+    {cat:'Sheet upkeep', title:'Monthly sheets behind', s:behind.length ? 'YELLOW' : 'GREEN', num:String(behind.length), unit:'monthly sheets behind where they should be', viz:segs(MONTHLY.map(x => x.s === 'INFO' ? 'GREY' : x.s)), detail:behind.length ? behind.slice(0,3).map(x => `${x.sheet} (${x.latest})`).join(', ') : 'Every sheet is where it should be', tab:'upkeep', at:'Month-by-month sheets', dest:'Sheet upkeep'},
+    {cat:'Sheet upkeep', title:'3rd-party rates missing', s:TP.s, num:String(TP.stores), unit:`store${TP.stores === 1 ? '' : 's'} took 3rd-party bookings with no rate`, viz:TP.rows.length ? bar([tpZero,'RED'],[tpFull,'YELLOW'],[TP.bookings - tpZero - tpFull,'GREY']) : check, detail:TP.rows.length ? `${plural(TP.bookings, 'booking')} in ${TP.days} days, mostly ${tpTop[0]}${tpTop[1] ? ' and ' + tpTop[1] : ''}` : `Every 3rd-party booking in ${TP.days} days found a rate`, tab:'upkeep', at:'3rd-party bookings', dest:'Sheet upkeep'}
   ];
 """
 
@@ -593,12 +631,28 @@ def main() -> None:
         html,
         "const p = new URLSearchParams({concept:state.concept, win:state.win});",
         "const p = new URLSearchParams({concept:state.concept, win:state.win});\n"
-        "  const tm = new URLSearchParams(location.search).get('tmonth'); if (tm) p.set('tmonth', tm);",
+        "  const tm = new URLSearchParams(location.search).get('tmonth'); if (tm) p.set('tmonth', tm);\n"
+        "  if (TP.days !== TP.default) p.set('tpdays', TP.days);",
         "Share URL keeps a non-default target month",
     )
     html = _replace_text(html, "renderAttn();\n\n/* ---------- line charts", "\n/* ---------- line charts", "defer renderAttn()")
     html = _replace_text(html, "renderMatrix();\n\n/* ---------- unmapped reviews", "\n/* ---------- unmapped reviews", "defer renderMatrix()")
-    html = _replace_once(html, r"showSource\('yelp'\);\n\$\('#mapProblems tbody'\)\.innerHTML = [^\n]*\n", "", "defer review drill-down + mapping table")
+    html = _replace_once(html, r"showSource\('yelp'\);\n", "", "defer review drill-down")
+    html = _replace_once(html, r"const NPS_UNM = \[\n.*?\n\];\n", "let NPS_UNM = [];   // from the API (Check 11c + its responses)\n", "unmapped NPS mock → from the API")
+    html = _replace_text(html, "}\nrenderNpsUnmapped();\n", "}\n", "defer unmapped NPS render")
+    html = _replace_once(html, r"\$\('#mapProblems tbody'\)\.innerHTML = [^\n]*\n", "", "defer mapping table")
+    html = _replace_once(
+        html,
+        r"const TP = \{days:90.*?\n\]\};\n",
+        "let TP = {days:90, default:90, max:365, cap:200, stores:0, bookings:0, s:'GREEN', rows:[]};   // from the API (Check 20 + its bookings)\n",
+        "3rd-party rates mock → from the API",
+    )
+    html = _replace_once(
+        html,
+        r"\$\('#tpDays'\)\.onchange = [^\n]*\nrenderThirdParty\(\);\n",
+        "$('#tpDays').onchange = () => loadThirdParty(+$('#tpDays').value);\n",
+        "3rd-party lookback picker → live re-query (and defer its render)",
+    )
     html = _replace_once(html, r"\$\('#orphanT'\)\.innerHTML = [^\n]*\nrenderTargets\(\);\n", "", "defer targets render")
     html = _replace_once(
         html,
@@ -625,7 +679,7 @@ def main() -> None:
         "suggestion note: live store name",
     )
     html = _replace_once(html, r"\(function\(\)\{\n  \$\('#slotsIssues tbody'\)", "function renderUpkeep(){\n  $('#slotsIssues tbody')", "sheet upkeep → renderUpkeep()")
-    html = _replace_text(html, "\n})();\n\n/* ---------- header actions", "\n}\n\n/* ---------- header actions", "close renderUpkeep()")
+    html = _replace_text(html, "\n})();\n\n/* ---------- 3rd-party rates", "\n}\n\n/* ---------- 3rd-party rates", "close renderUpkeep()")
     html = _replace_text(
         html,
         "<script>\n(function(){\n  const dc = document.getElementById('dc')",
@@ -658,7 +712,6 @@ def main() -> None:
     html = _replace_once(html, r'<div class="cats">\n.*?\n  </div>\n(?=\n  <!-- TABS -->)', '<div class="cats" id="cats"></div>\n', "category strip")
     html = _replace_once(html, r"<tbody>\s*<tr><td>GBGS Schaumburg</td>.*?</tbody>", '<tbody id="outTbl"></tbody>', "yesterday's outliers table")
     html = _kpis(html, "Unknown share of Revel revenue", "unkKpis", "unattributed revenue KPIs")
-    html = _replace_once(html, r"<tbody>\s*<tr><td>hubspot_survey</td>.*?</tbody>", '<tbody id="npsUnmTbl"></tbody>', "unmapped NPS table")
     html = _replace_text(html, '<div class="note" style="margin:0">No stores flagged.</div>', '<div id="npsNone"></div>', "stores with no NPS")
     html = _replace_once(
         html,
@@ -695,7 +748,7 @@ def main() -> None:
     steps.append("Injected:  live loader (authenticated API, cache served by the API, visible errors) + initDashboard()")
     steps.append("Injected:  Cognito auth-gate script before </body>")
 
-    leftovers = [s for s in ("mulberry(si", "const ATTN = [", "TG_EXCEPT", "Fifteen things", "NEWSTORES.has") if s in html]
+    leftovers = [s for s in ("mulberry(si", "const ATTN = [", "const NPS_UNM = [", "const TP = {", "TG_EXCEPT", "Fifteen things", "NEWSTORES.has") if s in html]
     if leftovers:
         sys.exit(f"ERROR: mock data still present after the build: {leftovers}")
 

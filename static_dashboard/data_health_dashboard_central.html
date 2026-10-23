@@ -86,6 +86,14 @@
   th { color: var(--muted); font-weight: 500; font-size: 12px; cursor: pointer; white-space: nowrap; user-select: none; }
   th:hover { color: var(--text); }
   td.hintcell { color: var(--muted); font-size: 12.5px; max-width: 360px; }
+  tr.pick { cursor: pointer; } tr.pick:hover td { background: var(--panel2); }
+  tr.pick.active td { background: color-mix(in srgb, var(--accent) 12%, var(--panel)); }
+  tr.pick.active td:first-child { box-shadow: 3px 0 0 var(--accent) inset; }
+  td.comment { min-width: 260px; max-width: 520px; white-space: pre-wrap; }
+  .tp-tools { display: flex; align-items: center; flex-wrap: wrap; gap: var(--xs); margin: 0 0 var(--sm); font-size: 12px; color: var(--muted); }
+  .tp-tools select:disabled { opacity: .5; cursor: progress; }
+  td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
+  td.tags { min-width: 200px; max-width: 360px; font-size: 12px; color: var(--muted); word-break: break-word; }
   .chip { display: inline-block; padding: 2px 9px; border-radius: 9999px; font-size: 11px; font-weight: 700; color: #fff; }
   .chip.RED { background: var(--red); } .chip.YELLOW { background: var(--yellow); color: #231a00; } .chip.GREEN { background: var(--green); }
   .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: var(--md); }
@@ -472,14 +480,12 @@ a { color: var(--accent); }
   <section class="pane" id="pane-nps">
     <div class="panel">
       <h2>NPS responses that landed without a store</h2>
-      <div class="hint">Checks 11 and 11c. Last 30 days, grouped by the location text the survey captured. A (null) location means the response never recorded where the guest played, which a store mapping can't fix.</div>
+      <div class="hint">Checks 11 and 11c. Last 30 days, grouped by the location text the survey captured. A (null) location means the response never recorded where the guest played, which a store mapping can't fix. Click a row to see the responses behind it.</div>
       <div class="tbl-wrap"><table>
         <thead><tr><th>Source</th><th>Last location played</th><th>Last GBGS location played</th><th>Responses</th><th>First seen</th><th>Last seen</th></tr></thead>
-        <tbody>
-          <tr><td>hubspot_survey</td><td>(null)</td><td>(null)</td><td><span class="chip YELLOW">75</span></td><td>2026-09-20</td><td>2026-10-19</td></tr>
-          <tr><td>hubspot_survey</td><td>Oak Brook</td><td>Oak Brook</td><td>1</td><td>2026-09-27</td><td>2026-09-27</td></tr>
-        </tbody>
+        <tbody id="npsUnmTbl"></tbody>
       </table></div>
+      <div id="npsDrill" style="margin-top:16px"></div>
     </div>
     <div class="panel">
       <h2>Stores with bookings but no NPS</h2>
@@ -624,6 +630,31 @@ a { color: var(--accent); }
       <div class="hint">Check 18. A store that opens needs a column in each of these sheets. A column under a slightly different ticker counts as missing.</div>
       <div class="tbl-wrap up-cov"><table class="up-tbl" id="covTbl"><thead></thead><tbody></tbody></table></div>
       <div class="up-note" id="covNote"></div>
+    </div>
+
+    <div class="panel" id="tpPanel">
+      <h2>3rd-party bookings with no rate in the sheet</h2>
+      <div class="hint">Check 20. Bookings tagged with a 3rd-party program (Viator, Groupon, Funex, MOA bundle and the rest) at a store whose row in the 2024 LBS Keys 3rd Party Info tab has no rate for that program. Without a rate the booking keeps whatever the guest paid, which usually shows up as full price or $0. Cancelled and demo bookings are left out. Click a row to see the bookings behind it.</div>
+      <div class="tp-tools">
+        <label for="tpDays">Look back</label>
+        <select id="tpDays">
+          <option value="30">30 days</option><option value="60">60 days</option><option value="90" selected>90 days</option>
+          <option value="180">180 days</option><option value="365">1 year</option>
+        </select>
+        <label for="tpConcept">Concept</label>
+        <select id="tpConcept"><option value="ALL">TEG + GBGS</option><option value="TEG">TEG only</option><option value="GBGS">GBGS only</option></select>
+        <label for="tpZone">Zone</label>
+        <select id="tpZone"><option value="ALL">All zones</option></select>
+        <label for="tpStore">Store</label>
+        <select id="tpStore"><option value="ALL">All stores</option></select>
+        <span id="tpStatus"></span>
+      </div>
+      <div class="kpis" id="tpKpis" style="margin-bottom:16px"></div>
+      <div class="tbl-wrap"><table class="up-tbl" id="tpTbl">
+        <thead><tr><th>Store</th><th>Program (sheet column)</th><th>Xola tag</th><th class="num">Bookings</th><th class="num">Paid $0</th><th class="num">No discount</th><th class="num">Amount paid</th><th>Last seen</th><th>What to do</th></tr></thead>
+        <tbody></tbody>
+      </table></div>
+      <div id="tpDrill" style="margin-top:16px"></div>
     </div>
 
     <div class="panel" id="monthlyPanel">
@@ -900,6 +931,40 @@ function showSource(src){
 }
 $$('#srcs .srcbtn').forEach(b => b.onclick = () => showSource(b.dataset.src));
 showSource('yelp');
+
+/* ---------- unmapped NPS: click a row for the responses behind it ---------- */
+const NPS_UNM = [
+  {source:'hubspot_survey', loc:'(null)', gbgs_loc:'(null)', responses:75, first_seen:'2026-09-20', last_seen:'2026-10-19', items:[
+    {d:'2026-10-19', played:null, game:null, rating:10, sentiment:'Promoter', comment:'Idk', contact_id:'256015381857'},
+    {d:'2026-10-18', played:null, game:null, rating:8, sentiment:'Passive', comment:'We played Special Ops. We enjoyed it immensely. But we noticed that some of the videos were not captioned.', contact_id:'255969918303'},
+    {d:'2026-10-16', played:null, game:null, rating:6, sentiment:'Detractor', comment:'Maybe more random stuff.', contact_id:'255455506348'},
+    {d:'2026-10-15', played:null, game:null, rating:10, sentiment:'Promoter', comment:null, contact_id:'255319729034'}]},
+  {source:'hubspot_survey', loc:'Oak Brook', gbgs_loc:'Oak Brook', responses:1, first_seen:'2026-09-27', last_seen:'2026-09-27', items:[
+    {d:'2026-09-27', played:'2026-09-19', game:'GBGS', rating:10, sentiment:'Promoter', comment:'Nothing', contact_id:'249524155254'}]}
+];
+const NPS_SENT = {Promoter:'GREEN', Passive:'YELLOW', Detractor:'RED'};
+let npsSel = -1;
+function renderNpsUnmapped(){
+  const esc = v => String(v ?? '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+  if (!NPS_UNM.length) {
+    $('#npsUnmTbl').innerHTML = '<tr><td colspan="6" class="hintcell">Every NPS response in the last 30 days has a store.</td></tr>';
+    $('#npsDrill').innerHTML = ''; return;
+  }
+  $('#npsUnmTbl').innerHTML = NPS_UNM.map((r,i) => {
+    const isNull = r.loc === '(null)' && r.gbgs_loc === '(null)';
+    return `<tr class="pick${i === npsSel ? ' active' : ''}" data-i="${i}" title="${r.responses === 1 ? 'Show this response' : `Show these ${r.responses} responses`}"><td>${esc(r.source)}</td><td>${esc(r.loc)}</td><td>${esc(r.gbgs_loc)}</td><td>${isNull ? `<span class="chip YELLOW">${r.responses}</span>` : r.responses}</td><td>${r.first_seen}</td><td>${r.last_seen}</td></tr>`; }).join('');
+  $$('#npsUnmTbl tr.pick').forEach(tr => tr.onclick = () => { npsSel = npsSel === +tr.dataset.i ? -1 : +tr.dataset.i; renderNpsUnmapped(); });
+  const g = NPS_UNM[npsSel];
+  if (!g) { $('#npsDrill').innerHTML = ''; return; }
+  const where = g.loc === '(null)' && g.gbgs_loc === '(null)' ? 'with no location' : `naming ${esc(g.loc !== '(null)' ? g.loc : g.gbgs_loc)}`;
+  $('#npsDrill').innerHTML = `<div class="hint" style="margin-bottom:8px">${g.items.length} response${g.items.length === 1 ? '' : 's'} ${where}, newest first. Look a guest up in HubSpot by contact ID to find where they played.</div>
+    <div class="tbl-wrap"><table>
+    <thead><tr><th>Survey date</th><th>Rating</th><th>Played on</th><th>Game</th><th>Comment</th><th>HubSpot contact</th></tr></thead>
+    <tbody>${g.items.map(x => `<tr>
+      <td>${x.d}</td><td><span class="chip ${NPS_SENT[x.sentiment] || 'YELLOW'}">${x.rating ?? '—'}</span></td><td>${x.played ? esc(x.played) : '—'}</td><td>${x.game ? esc(x.game) : '—'}</td>
+      <td class="comment">${x.comment ? esc(x.comment) : '<span style="color:var(--muted)">(no comment)</span>'}</td><td class="mono">${esc(x.contact_id)}</td></tr>`).join('')}</tbody></table></div>`;
+}
+renderNpsUnmapped();
 $('#mapProblems tbody').innerHTML = MAPPROB.map(r => `<tr><td>${r[0]}</td><td class="mono">${r[1]}</td><td class="mono">${r[2]}</td><td class="mono">${r[3]}</td><td><span class="chip ${r[4]==='Case mismatch'?'RED':'YELLOW'}">${r[4]}</span></td></tr>`).join('');
 
 /* ---------- targets tab ---------- */
@@ -1082,6 +1147,96 @@ const MONTHLY = [
   $('#monthlyTbl tbody').innerHTML = MONTHLY.map(r => `<tr><td>${r.sheet}</td><td>${r.latest}</td><td>${r.n}</td><td>${r.reach}</td><td><span class="chip ${r.s}">${r.s === 'INFO' ? 'Exceptions' : r.s === 'GREEN' ? 'Current' : 'Behind'}</span></td><td class="fix">${r.note}</td></tr>`).join('');
 })();
 
+/* ---------- 3rd-party rates (Check 20): adjustable lookback, click a row for its bookings ---------- */
+const TP = {days:90, default:90, max:365, cap:200, stores:18, bookings:390, s:'YELLOW', rows:[
+  {store:'GBGS Opry', concept:'GBGS', zone:'Zone C', ticker:'GBGSOpry', tag:'VIATOR', sheet_column:'Viator', sheet_row:66, bookings:96, fully_discounted:0, full_price:96, paid:12132.91, first_seen:'2026-07-25', last_seen:'2026-10-22', fix:'Fill in Viator on the GBGSOpry row (row 66).', items:[
+    {d:'2026-10-22', created:'2026-10-22', booking_id:'6adaac80388aa572b40a87a7', row_id:'e73c84c4-aade-5f9b-9119-ad79c13e2618', sys:'xola_x2', channel:'viator', guests:3, base:119.97, discount:0, paid:93.57, coupon:null, tags:'VIATOR,VIATOR REF 1458961847'},
+    {d:'2026-10-22', created:'2026-10-20', booking_id:'6ad833eca55410ad02019d88', row_id:'eea856c8-45fb-53b5-b391-782281056773', sys:'xola_x2', channel:'viator', guests:3, base:119.97, discount:0, paid:93.57, coupon:null, tags:'VIATOR,VIATOR REF 1458455585'},
+    {d:'2026-10-20', created:'2026-09-22', booking_id:'6ab28bd8980ea9a3650e34e1', row_id:'cd08dad6-9421-5187-a167-94fd0127681e', sys:'xola_x2', channel:'viator', guests:2, base:79.98, discount:0, paid:62.38, coupon:null, tags:'VIATOR,VIATOR REF 1449852325'}]},
+  {store:'GBGS Atlanta: The Battery', concept:'GBGS', zone:'Zone A', ticker:'GBGSATL', tag:'VIATOR', sheet_column:'Viator', sheet_row:87, bookings:53, fully_discounted:2, full_price:51, paid:4603.68, first_seen:'2026-08-29', last_seen:'2026-10-22', fix:'Fill in Viator on the GBGSATL row (row 87).', items:[
+    {d:'2026-10-22', created:'2026-10-21', booking_id:'6ad8ce70430147b97903b516', row_id:'7d0abb6c-8f57-55d6-9a46-573f83a0e88a', sys:'xola_x2', channel:'viator', guests:2, base:81.98, discount:0, paid:63.94, coupon:null, tags:'VIATOR,VIATOR REF 1458559877'},
+    {d:'2026-10-18', created:'2026-10-11', booking_id:'6acbc120361f83245f0ee907', row_id:'6a8fef11-8f77-5c34-a3e7-e3aa7fd3534d', sys:'xola_x2', channel:'viator', guests:4, base:163.96, discount:0, paid:127.88, coupon:null, tags:'VIATOR,VIATOR REF 1455709405'},
+    {d:'2026-10-18', created:'2026-10-18', booking_id:'6ad4f4ba88d64fc2980e39de', row_id:'be4ae494-0bd5-5706-86ef-4f7c021e9f40', sys:'xola_x2', channel:'viator', guests:2, base:81.98, discount:0, paid:63.94, coupon:null, tags:'VIATOR,VIATOR REF 1457733675'}]},
+  {store:'GBGS Georgetown', concept:'GBGS', zone:'Zone A', ticker:'GBGSGT', tag:'VIATOR', sheet_column:'Viator', sheet_row:73, bookings:39, fully_discounted:0, full_price:39, paid:4912.5, first_seen:'2026-07-31', last_seen:'2026-10-18', fix:'Fill in Viator on the GBGSGT row (row 73).', items:[
+    {d:'2026-10-18', created:'2026-10-16', booking_id:'6ad2c8d5c7342089eb006992', row_id:'377bb435-eaa3-54bc-83eb-f46412bceb25', sys:'xola_x2', channel:'viator', guests:7, base:293.93, discount:0, paid:229.25, coupon:null, tags:'VIATOR,VIATOR REF 1457281741'},
+    {d:'2026-10-17', created:'2026-10-12', booking_id:'6accd9b8e6a92eefb10f1f82', row_id:'a3851e59-633f-5c5b-866e-bd1391ff0211', sys:'xola_x2', channel:'viator', guests:2, base:83.98, discount:0, paid:65.5, coupon:null, tags:'VIATOR,VIATOR REF 1455959827'},
+    {d:'2026-10-16', created:'2026-10-16', booking_id:'6ad230bb36a9de38a307e0e3', row_id:'86706433-e3f7-5eb0-95b8-df7c44265ff4', sys:'xola_x2', channel:'viator', guests:1, base:41.99, discount:0, paid:32.75, coupon:null, tags:'VIATOR,VIATOR REF 1457130533'}]},
+  {store:'GBGS Houston', concept:'GBGS', zone:'Zone A', ticker:'GBGSHOU', tag:'VIATOR', sheet_column:'Viator', sheet_row:70, bookings:32, fully_discounted:0, full_price:32, paid:3680.42, first_seen:'2026-07-25', last_seen:'2026-10-20', fix:'Fill in Viator on the GBGSHOU row (row 70).', items:[
+    {d:'2026-10-20', created:'2026-10-17', booking_id:'6ad36cfdbe934dd20006062c', row_id:'501f0112-d2cf-5e3e-b241-ad672dc3bacd', sys:'xola_x2', channel:'viator', guests:2, base:79.98, discount:0, paid:62.38, coupon:null, tags:'VIATOR,VIATOR REF 1457387059'},
+    {d:'2026-10-11', created:'2026-10-11', booking_id:'6acbbda19018ad98dd08db78', row_id:'2eae5a9a-3f78-517d-af23-a4f2001c732a', sys:'xola_x2', channel:'viator', guests:3, base:119.97, discount:0, paid:93.57, coupon:null, tags:'VIATOR,VIATOR REF 1455704633'},
+    {d:'2026-10-09', created:'2026-10-03', booking_id:'6ac18b905b2b6a70e0094f43', row_id:'d3cda7c3-a609-5eb9-8cc3-58703cf46638', sys:'xola_x2', channel:'viator', guests:2, base:79.98, discount:0, paid:62.38, coupon:null, tags:'VIATOR,VIATOR REF 1453380289'}]},
+  {store:'GBGS Times Square', concept:'GBGS', zone:'Zone A', ticker:'GBGSTSQ', tag:'VIATOR', sheet_column:'Viator', sheet_row:81, bookings:29, fully_discounted:0, full_price:29, paid:3357.3, first_seen:'2026-09-10', last_seen:'2026-10-18', fix:'Fill in Viator on the GBGSTSQ row (row 81).', items:[
+    {d:'2026-10-18', created:'2026-10-16', booking_id:'6ad29064662f8a83090d52ba', row_id:'9ba7c843-563c-5d40-bc36-c14f4cf8febe', sys:'xola_x2', channel:'viator', guests:4, base:187.96, discount:0, paid:146.6, coupon:null, tags:'VIATOR,VIATOR REF 1457236239'},
+    {d:'2026-10-18', created:'2026-09-30', booking_id:'6abd754929f31e20d107fc70', row_id:'2cad8c82-93a0-59cc-8652-7a37e5788cb9', sys:'xola_x2', channel:'viator', guests:2, base:93.98, discount:0, paid:73.3, coupon:null, tags:'VIATOR,VIATOR REF 1452442115'},
+    {d:'2026-10-18', created:'2026-10-18', booking_id:'6ad53958ff461b5c3906fd80', row_id:'a8a664ef-fd3f-58c5-8efd-7fd4e5c11a38', sys:'xola_x2', channel:'viator', guests:2, base:93.98, discount:0, paid:73.3, coupon:null, tags:'VIATOR,VIATOR REF 1457817565'}]},
+  {store:'GBGS New Jersey', concept:'GBGS', zone:'Zone A', ticker:'GBGSAD', tag:'MOABUNDLE', sheet_column:'Moa Attraction Bundle', sheet_row:75, bookings:3, fully_discounted:0, full_price:3, paid:1534.96, first_seen:'2026-08-11', last_seen:'2026-08-11', fix:'Fill in Moa Attraction Bundle on the GBGSAD row (row 75).', items:[
+    {d:'2026-08-11', created:'2025-12-19', booking_id:null, row_id:'01dd40c6-050d-54a9-b320-601cd8ef93f2', sys:'resova', channel:'manual', guests:15, base:null, discount:null, paid:523.28, coupon:null, tags:'HOLIDAY20, MILITARY15, MOABUNDLE, REPLAY20, REPLAY_20, TEGPROMO, TEG_PR0M0'},
+    {d:'2026-08-11', created:'2025-12-19', booking_id:null, row_id:'25e1197a-d987-5653-a7a4-9e9f82a20aa5', sys:'resova', channel:'manual', guests:14, base:null, discount:null, paid:488.4, coupon:null, tags:'HOLIDAY20, MILITARY15, MOABUNDLE, REPLAY20, REPLAY_20, TEGPROMO, TEG_PR0M0'},
+    {d:'2026-08-11', created:'2025-12-19', booking_id:null, row_id:'f733de58-bb31-5ab3-8ec9-aabba16d927d', sys:'resova', channel:'manual', guests:15, base:null, discount:null, paid:523.28, coupon:null, tags:'HOLIDAY20, MILITARY15, MOABUNDLE, REPLAY20, REPLAY_20, TEGPROMO, TEG_PR0M0'}]},
+  {store:'GBGS Las Vegas', concept:'GBGS', zone:'Zone B', ticker:'GBGSLV', tag:'GROUPON4MF', sheet_column:'Groupon 4 Person Mon Fri', sheet_row:74, bookings:2, fully_discounted:1, full_price:0, paid:255.79, first_seen:'2026-07-29', last_seen:'2026-07-29', fix:'Fill in Groupon 4 Person Mon Fri on the GBGSLV row (row 74).', items:[
+    {d:'2026-07-29', created:'2026-07-29', booking_id:'6a6a0bf98aa28694b90ac85c', row_id:'16e8721f-7418-5888-a093-6b8187b2f7d9', sys:'xola_x2', channel:'office', guests:7, base:300.93, discount:45.14, paid:255.79, coupon:'grouponmatch15', tags:'GROUPONMATCH,MULTI-ITEM,GROUPON,GROUPON4MF,GROUPONMATCH15,XJ8PH4B44K9Q'},
+    {d:'2026-07-29', created:'2026-07-29', booking_id:'6a6a0bf98aa28694b90ac85c', row_id:'7e63da81-0b35-52a2-b336-4dc959413fd9', sys:'xola_x2', channel:'office', guests:4, base:171.96, discount:171.96, paid:0, coupon:'xj8ph4b44k9q', tags:'GROUPONMATCH,MULTI-ITEM,GROUPON,GROUPON4MF,GROUPONMATCH15,XJ8PH4B44K9Q'}]},
+  {store:'Columbus', concept:'TEG', zone:'Zone 2', ticker:'EAS', tag:'VIRGIN_BOOKING', sheet_column:'Virgin Experience Gifts', sheet_row:11, bookings:1, fully_discounted:1, full_price:0, paid:0, first_seen:'2026-09-22', last_seen:'2026-09-22', fix:'Fill in Virgin Experience Gifts on the EAS row (row 11).', items:[
+    {d:'2026-09-22', created:'2026-09-02', booking_id:'6a98d47a66cf7231a40a863a', row_id:'c535345a-71e9-5c8e-a4d7-4a39e3e8a572', sys:'xola_x2', channel:'office', guests:2, base:77.98, discount:77.98, paid:0, coupon:'virgin_booking', tags:'CLOUD9BOOKING,VIRGIN_BOOKING'}]},
+  {store:"San Francisco: Fisherman's Wharf", concept:'TEG', zone:'Zone 1', ticker:'SFW', tag:'GROUPON8ANYGBGS', sheet_column:'Groupon 8 Players Any Day', sheet_row:46, bookings:1, fully_discounted:1, full_price:0, paid:0, first_seen:'2026-10-17', last_seen:'2026-10-17', fix:'Fill in Groupon 8 Players Any Day on the SFW row (row 46).', items:[
+    {d:'2026-10-17', created:'2026-10-17', booking_id:'6ad44e8b87168656030a740e', row_id:'854382f6-e2bb-5105-902c-aa9fa15c44dc', sys:'xola_x2', channel:'checkout', guests:2, base:91.98, discount:91.98, paid:0, coupon:'qtqsfrbxrast', tags:'GROUPON8ANYGBGS,QTQSFRBXRAST,TEG_BOOKING_WIDGET'}]}
+]};
+let tpSel = null;   // ticker|tag of the open row; kept across lookback changes while that row still exists
+// Panel-only filters (the Overview finding and the Data Central tile stay network-wide).
+// Zone choices follow the concept and store choices follow both, drawn from the rows in the current window.
+const tpFilter = {concept:'ALL', zone:'ALL', store:'ALL'};
+function renderThirdParty(){
+  const esc = v => String(v ?? '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+  const usd = v => '$' + Math.round(v || 0).toLocaleString(), MON = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+  const cents = v => v == null ? '—' : '$' + (+v).toFixed(2);
+  const md = iso => iso ? MON[+iso.slice(5,7)-1] + ' ' + (+iso.slice(8,10)) : '—';
+  const key = r => r.ticker + '|' + r.tag;
+  const f = tpFilter, uniq = a => [...new Set(a.filter(Boolean))].sort((x,y) => x.localeCompare(y, undefined, {numeric:true}));
+  const byConcept = TP.rows.filter(r => f.concept === 'ALL' || r.concept === f.concept);
+  const zones = uniq(byConcept.map(r => r.zone)); if (!zones.includes(f.zone)) f.zone = 'ALL';
+  const byZone = byConcept.filter(r => f.zone === 'ALL' || r.zone === f.zone);
+  const stores = uniq(byZone.map(r => r.store)); if (!stores.includes(f.store)) f.store = 'ALL';
+  const rows = byZone.filter(r => f.store === 'ALL' || r.store === f.store);
+  const opts = (all, list, cur) => `<option value="ALL">${all}</option>` + list.map(v => `<option value="${esc(v)}"${v === cur ? ' selected' : ''}>${esc(v)}</option>`).join('');
+  $('#tpConcept').value = f.concept;
+  $('#tpZone').innerHTML = opts('All zones', zones, f.zone);
+  $('#tpStore').innerHTML = opts('All stores', stores, f.store);
+  const sum = k => rows.reduce((a,r) => a + (r[k] || 0), 0);
+  const total = sum('bookings'), nStores = new Set(rows.map(r => r.store)).size, zero = sum('fully_discounted'), full = sum('full_price');
+  const filtered = rows.length !== TP.rows.length;
+  const kpi = (v, label, color) => `<div class="kpi"><b${color ? ` style="color:var(--${color})"` : ''}>${v}</b><span>${label}</span></div>`;
+  $('#tpDays').value = String(TP.days);
+  $('#tpStatus').textContent = `Arrivals in the last ${TP.days === 365 ? 'year' : TP.days + ' days'}.`
+    + (filtered ? ` Showing ${rows.length} of ${TP.rows.length} rows.` : '')
+    + (TP.days !== TP.default || filtered ? ` The Overview finding covers every store over the default ${TP.default} days.` : '');
+  $('#tpKpis').innerHTML = kpi(total, '3rd-party bookings with no rate', total ? 'yellow' : 'green')
+    + kpi(nStores, `Store${nStores === 1 ? '' : 's'} affected`, nStores ? 'yellow' : 'green')
+    + kpi(full, 'Paid, no discount')
+    + kpi(zero, 'Paid $0 (fully discounted)');
+  if (!rows.some(r => key(r) === tpSel)) tpSel = null;
+  $('#tpTbl tbody').innerHTML = rows.length ? rows.map(r => `<tr class="pick${key(r) === tpSel ? ' active' : ''}" data-k="${esc(key(r))}" title="${r.bookings === 1 ? 'Show this booking' : `Show these ${r.bookings} bookings`}"><td>${esc(r.store)}</td><td>${esc(r.sheet_column)}</td><td class="mono">${esc(r.tag)}</td>
+      <td class="num"><span class="chip YELLOW">${r.bookings}</span></td><td class="num">${r.fully_discounted}</td><td class="num">${r.full_price}</td><td class="num">${usd(r.paid)}</td>
+      <td>${md(r.last_seen)}</td><td class="fix">${esc(r.fix)}</td></tr>`).join('')
+    : `<tr><td colspan="9" class="hintcell">${TP.rows.length ? 'No rows match these filters.' : `Every 3rd-party booking in the last ${TP.days} days found a rate in the sheet.`}</td></tr>`;
+  $$('#tpTbl tbody tr.pick').forEach(tr => tr.onclick = () => { tpSel = tpSel === tr.dataset.k ? null : tr.dataset.k; renderThirdParty(); });
+  const g = rows.find(r => key(r) === tpSel);
+  if (!g) { $('#tpDrill').innerHTML = ''; return; }
+  const items = g.items || [], more = g.bookings - items.length;
+  $('#tpDrill').innerHTML = `<div class="hint" style="margin-bottom:8px">${esc(g.store)}, ${esc(g.sheet_column)}: ${items.length === 1 ? 'the booking' : more > 0 ? `the newest ${items.length} of ${g.bookings} bookings` : `${items.length} bookings`}, newest arrival first.
+      Look a booking up in Xola by its booking ID. Resova bookings have no Xola ID, so they show the warehouse row ID (fct_ops_bookings_adjustments.ID) instead.</div>
+    <div class="tbl-wrap"><table>
+    <thead><tr><th>Arrival</th><th>Created</th><th>Booking ID</th><th>System</th><th>Channel</th><th class="num">Guests</th><th class="num">Base</th><th class="num">Discount</th><th class="num">Paid</th><th>Coupon</th><th>Tags</th></tr></thead>
+    <tbody>${items.map(x => `<tr>
+      <td>${x.d}</td><td>${x.created || '—'}</td>
+      <td class="mono">${x.booking_id ? esc(x.booking_id) : `<span style="color:var(--muted)" title="Warehouse row ID (no Xola ID)">${esc(x.row_id)}</span>`}</td>
+      <td>${x.sys === 'resova' ? 'Resova' : x.sys === 'xola_x2' ? 'Xola' : esc(x.sys)}</td><td>${esc(x.channel)}</td><td class="num">${x.guests ?? '—'}</td>
+      <td class="num">${cents(x.base)}</td><td class="num">${cents(x.discount)}</td><td class="num">${x.paid === 0 ? '<span class="chip RED">$0.00</span>' : cents(x.paid)}</td>
+      <td class="mono">${x.coupon ? esc(x.coupon) : '—'}</td><td class="tags">${esc(x.tags)}</td></tr>`).join('')}</tbody></table></div>`;
+}
+['concept','zone','store'].forEach(k => $('#tp' + k[0].toUpperCase() + k.slice(1)).onchange = e => { tpFilter[k] = e.target.value; renderThirdParty(); });
+$('#tpDays').onchange = () => { TP.days = +$('#tpDays').value; renderThirdParty(); toast('Mock data: the live page re-runs the check for ' + TP.days + ' days'); };
+renderThirdParty();
+
 /* ---------- header actions ---------- */
 $('#btnTheme').onclick = () => { const h = document.documentElement; h.dataset.theme = h.dataset.theme==='dark' ? 'light' : 'dark'; };
 $('#btnShare').onclick = () => {
@@ -1106,7 +1261,7 @@ document.getElementById('btnReview').onclick = () => {
 <div class="dc" id="dc" role="dialog" aria-modal="true" aria-labelledby="dcTitle">
   <div class="dc-head">
     <span class="dc-brand" aria-hidden="true"><svg viewBox="0 0 24 24" width="22" height="22"><path d="M3 13h4l2.5-6 4 11 2.5-5H21" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
-    <div class="dc-titles"><h2 id="dcTitle">Data Central</h2><p id="dcSub">21 checks across freshness, revenue, reviews, surveys, targets and integrity. Select a tile to open its details.</p></div>
+    <div class="dc-titles"><h2 id="dcTitle">Data Central</h2><p id="dcSub">22 checks across freshness, revenue, reviews, surveys, targets and integrity. Select a tile to open its details.</p></div>
     <span class="dc-spacer"></span>
     <button class="dc-ghost" id="dcFindings"></button>
     <button class="dc-ghost" id="dcTheme">Light / Dark</button>
@@ -1168,7 +1323,8 @@ document.getElementById('btnReview').onclick = () => {
     {cat:'Targets (November)', title:'Unrecognised target tickers', s:'INFO', num:String(ORPHAN_T.length), unit:"tickers that aren't stores", viz:'<span class="dc-viz"></span>', detail:'Placeholders such as TEMPFUL, or stores not yet open', tab:'targets', at:'Target rows under a ticker', dest:'Targets'},
     {cat:'Sheet upkeep', title:'Slots upkeep', s:'RED', num:'5', unit:'open stores show 0 slots', viz:bar([2,'RED'],[3,'ORANGE']), detail:'2 missing from the sheet, 3 the aggregate is not picking up. 5 more where Team Info disagrees', tab:'upkeep', at:'Slots upkeep', dest:'Sheet upkeep'},
     {cat:'Sheet upkeep', title:'Stores missing from sheets', s:'YELLOW', num:String(new Set(SHEET_COV.flatMap(x => x.missing)).size), unit:'stores missing from at least one sheet', viz:segs(SHEET_COV.map(x => 'YELLOW').concat(SHEET_COV_CLEAN.map(x => 'GREEN'))), detail:`${SHEET_COV.reduce((a,x) => a + x.missing.length, 0)} gaps across ${SHEET_COV.length} of ${SHEET_COV.length + SHEET_COV_CLEAN.length} sheets. Worst: GBGS Richmond, Topanga, Dania`, tab:'upkeep', at:'New-store checklist', dest:'Sheet upkeep'},
-    {cat:'Sheet upkeep', title:'Monthly sheets behind', s:'YELLOW', num:String(MONTHLY.filter(x => x.s === 'YELLOW').length), unit:'monthly sheets behind where they should be', viz:segs(MONTHLY.map(x => x.s === 'INFO' ? 'GREY' : x.s)), detail:'Revenue adjustment (since June), NetSuite actuals (September), guest care', tab:'upkeep', at:'Month-by-month sheets', dest:'Sheet upkeep'}
+    {cat:'Sheet upkeep', title:'Monthly sheets behind', s:'YELLOW', num:String(MONTHLY.filter(x => x.s === 'YELLOW').length), unit:'monthly sheets behind where they should be', viz:segs(MONTHLY.map(x => x.s === 'INFO' ? 'GREY' : x.s)), detail:'Revenue adjustment (since June), NetSuite actuals (September), guest care', tab:'upkeep', at:'Month-by-month sheets', dest:'Sheet upkeep'},
+    {cat:'Sheet upkeep', title:'3rd-party rates missing', s:TP.s, num:String(TP.stores), unit:'stores took 3rd-party bookings with no rate', viz:bar([2+1+1+1,'RED'],[96+51+39+32+29+3,'YELLOW']), detail:'390 bookings in 90 days, mostly Viator at GBGS stores', tab:'upkeep', at:'3rd-party bookings', dest:'Sheet upkeep'}
   ];
   const WORD = {RED:'Red', YELLOW:'Yellow', GREEN:'Green', INFO:'Info'};
   grid.innerHTML = T.map((t,i) => `<button class="dc-tile" data-i="${i}" data-s="${t.s}" aria-label="${t.title}: ${t.num} ${t.unit}. Opens ${t.dest}.">

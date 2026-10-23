@@ -551,6 +551,19 @@ WHERE DIM_STORES_MASTER_ID IS NULL AND SURVEY_DATE >= DATEADD(day,-30,CURRENT_DA
 GROUP BY 1,2,3 ORDER BY responses DESC
 """
 
+# Check 11c drill-down: the responses behind each unmapped_nps row, attached
+# to their group in build_nps. No guest name, email or phone; the HubSpot
+# contact ID is enough to look the guest up.
+QUERIES["unmapped_nps_rows"] = """
+SELECT SOURCE AS source, COALESCE(LAST_LOCATION_PLAYED,'(null)') AS loc,
+       COALESCE(LAST_GBGS_LOCATION_PLAYED,'(null)') AS gbgs_loc,
+       SURVEY_DATE::DATE AS d, LAST_DATE_PLAYED AS played, GAME AS game, NPS_RATING::INT AS rating,
+       SENTIMENT AS sentiment, FOLLOW_UP AS comment, HUBSPOT_CONTACT_ID::NUMBER(38,0)::STRING AS contact_id
+FROM TEG_PROD.DW.FCT_NPS_DETAILS
+WHERE DIM_STORES_MASTER_ID IS NULL AND SURVEY_DATE >= DATEADD(day,-30,CURRENT_DATE)
+ORDER BY SURVEY_DATE DESC, SUBMISSION_TIMESTAMP DESC
+"""
+
 # Check 12a. Sparse (no row for a zero week); zero-filled and the trailing
 # average computed in Python, since a SQL window over sparse rows skips the
 # zero weeks.
@@ -851,6 +864,66 @@ LEFT JOIN TEG_PROD.STAGE.STG_GOOGLE_DRIVE__FIVETRAN_2026_GC_DATA_FOR_SNOWFLAKE_G
 GROUP BY 1
 """
 
+# Check 20: bookings carrying a 3rd-party tag (one of the Xola tags in the
+# 3rd Party Info tab's tag row) that dbt didn't treat as 3rd party, because
+# that store's row has no rate for that tag. Matching is on the tag, case- and
+# space-insensitive, same as dbt; IS_THIRD_PARTY = 1 on every booking it gave
+# a rate to. {tp_days} is the lookback (default 90, adjustable to 365).
+# Bookings join to stores the way _AGG_BOOKINGS_DAY does (STORE_ID =
+# DIM_STORES_ID), not by REVENUE_STORE_ID. Checked 2026-10-23: the two agree
+# except ~1,300 Remote Adventures bookings a year, none of them 3rd party.
+TP_DAYS_DEFAULT = 90
+TP_DAYS_MAX = 365
+TP_ROWS_CAP = 200  # bookings per store + program in the drill-down, newest first
+_TP_BOOKINGS = f"""WITH {SCOPE_STORES_CTE}, sheet AS (
+    SELECT _LINE AS line, UPPER(TRIM(TICKER_FIN)) AS tk, OBJECT_CONSTRUCT_KEEP_NULL(*) AS o
+    FROM TEG_PROD.STAGE.STG_GOOGLE_DRIVE___2024_LBS_KEYS_3_RD_PARTY_INFO
+), tag_cols AS (
+    SELECT UPPER(TRIM(f.value::STRING)) AS tag, MIN(f.key) AS col
+    FROM sheet, LATERAL FLATTEN(input => o) f
+    WHERE line = 1 AND f.key NOT IN ('_LINE','_FIVETRAN_SYNCED','PROGRAM_NAME','TICKER_FIN','TEG_RETAIL_RATE','TEG_RACK_RATE')
+      AND NULLIF(TRIM(f.value::STRING),'') IS NOT NULL
+    GROUP BY 1
+), sheet_rows AS (
+    SELECT tk, MIN(line) AS line FROM sheet WHERE line > 1 GROUP BY 1
+), bk AS (
+    SELECT DISTINCT b.ID, s.LBS_NAME, s.CONCEPT, s.TICKER_FIN, d._ZONE_2026 AS ZONE, t.tag, t.col, b.AMOUNT_PAID, b.DISCOUNT_AMOUNT, b.ARRIVAL_DATE,
+           b.BASE_AMOUNT, b.BOOKINGS_CREATED_ON, b.X_BOOKING_ID, b.BOOKING_SOURCE, b.SOURCE, b.GUESTS, b.COUPON_CODE, b.TAGS
+    FROM TEG_PROD.DW.FCT_OPS_BOOKINGS_ADJUSTMENTS b
+    JOIN TEG_PROD.DW.DIM_STORES_MASTER d ON d.DIM_STORES_ID = b.STORE_ID
+    JOIN scope_stores s ON s.DIM_STORES_MASTER_ID = d.ID,
+         LATERAL FLATTEN(input => b.TAGS_ARRAY) f
+    JOIN tag_cols t ON t.tag = UPPER(TRIM(f.value::STRING))
+    WHERE b.ARRIVAL_DATE >= DATEADD(day, -{{tp_days}}, CURRENT_DATE) AND b.ARRIVAL_DATE < CURRENT_DATE
+      AND COALESCE(b.IS_THIRD_PARTY, 0) = 0
+      AND COALESCE(b.IS_DEMO_TRAINING, 0) = 0
+      AND COALESCE(b.BOOKING_STATUS, '') <> '700'   -- cancelled
+)"""
+
+QUERIES["tp_rates"] = _TP_BOOKINGS + f"""
+SELECT bk.LBS_NAME AS store, bk.CONCEPT AS concept, bk.ZONE AS zone, bk.TICKER_FIN AS ticker, bk.tag,
+       INITCAP(REPLACE(TRIM(bk.col, '_'), '_', ' ')) AS sheet_column, r.line + {SHEET_ROW_OFFSET} AS sheet_row,
+       COUNT(*) AS bookings, COUNT_IF(bk.AMOUNT_PAID = 0) AS fully_discounted,
+       COUNT_IF(bk.AMOUNT_PAID > 0 AND COALESCE(bk.DISCOUNT_AMOUNT, 0) = 0) AS full_price,
+       ROUND(SUM(bk.AMOUNT_PAID), 2) AS paid, MIN(bk.ARRIVAL_DATE)::DATE AS first_seen, MAX(bk.ARRIVAL_DATE)::DATE AS last_seen
+FROM bk LEFT JOIN sheet_rows r ON r.tk = UPPER(TRIM(bk.TICKER_FIN))
+GROUP BY 1, 2, 3, 4, 5, 6, 7
+ORDER BY bookings DESC, store
+"""
+
+# Check 20 drill-down: the bookings behind each tp_rates row, attached to their
+# row in build_third_party. No guest name or email; the Xola booking ID is
+# enough to look a booking up. Resova bookings have no Xola ID (or any native
+# ID in this table), so row_id is the warehouse ID to find them by.
+QUERIES["tp_rates_rows"] = _TP_BOOKINGS + f"""
+SELECT bk.TICKER_FIN AS ticker, bk.tag, bk.ARRIVAL_DATE::DATE AS d, bk.BOOKINGS_CREATED_ON::DATE AS created,
+       bk.X_BOOKING_ID AS booking_id, bk.ID AS row_id, bk.BOOKING_SOURCE AS sys, bk.SOURCE AS channel, bk.GUESTS AS guests,
+       bk.BASE_AMOUNT AS base, bk.DISCOUNT_AMOUNT AS discount, bk.AMOUNT_PAID AS paid, bk.COUPON_CODE AS coupon, bk.TAGS AS tags
+FROM bk
+QUALIFY ROW_NUMBER() OVER (PARTITION BY bk.TICKER_FIN, bk.tag ORDER BY bk.ARRIVAL_DATE DESC, bk.ID) <= {TP_ROWS_CAP}
+ORDER BY ticker, tag, d DESC
+"""
+
 
 # ---------------------------------------------------------------------------
 # Query runner. Every check is independent, so they run concurrently on one
@@ -880,7 +953,10 @@ def _target_month(value: Optional[str], today: date) -> date:
         raise HTTPException(status_code=400, detail=f"target_month must be YYYY-MM, got {value!r}")
 
 
-def run_queries(names: list[str], target_month: Optional[str] = None) -> dict:
+def run_queries(names: list[str], target_month: Optional[str] = None, tp_days: int = TP_DAYS_DEFAULT) -> dict:
+    tp_days = int(tp_days)
+    if not 1 <= tp_days <= TP_DAYS_MAX:
+        raise HTTPException(status_code=400, detail=f"tp_days must be 1 to {TP_DAYS_MAX}, got {tp_days}")
     conn = get_conn()
     try:
         cur = conn.cursor(DictCursor)
@@ -889,13 +965,14 @@ def run_queries(names: list[str], target_month: Optional[str] = None) -> dict:
         today = date.fromisoformat(meta["today"])
         tm = _target_month(target_month, today)
         meta["target_month"] = tm.isoformat()
+        meta["tp_days"] = tp_days
         timings: dict[str, float] = {}
 
         def one(name: str) -> list[dict]:
             t0 = time.time()
             c = conn.cursor(DictCursor)
             try:
-                c.execute(QUERIES[name].replace("{target_month}", f"'{tm.isoformat()}'"))
+                c.execute(QUERIES[name].replace("{target_month}", f"'{tm.isoformat()}'").replace("{tp_days}", str(tp_days)))
                 rows = [{k.lower(): _clean(v) for k, v in row.items()} for row in c.fetchall()]
             finally:
                 c.close()
@@ -1241,6 +1318,10 @@ def build_nps(r: dict, findings: list, stores: list[dict]) -> dict:
     srcs = [x for x in r["unmapped_src"] if x["kind"] == "nps"]
     unmapped_total = sum(x["unmapped_30d"] for x in srcs)
     rows = r["unmapped_nps"]
+    for x in rows:
+        x["items"] = [{k: y[k] for k in ("d", "played", "game", "rating", "sentiment", "comment", "contact_id")}
+                      for y in r.get("unmapped_nps_rows", [])
+                      if (y["source"], y["loc"], y["gbgs_loc"]) == (x["source"], x["loc"], x["gbgs_loc"])]
     null_loc = sum(x["responses"] for x in rows if x["loc"] == "(null)" and x["gbgs_loc"] == "(null)")
     if unmapped_total:
         named = [x for x in rows if not (x["loc"] == "(null)" and x["gbgs_loc"] == "(null)")]
@@ -1687,6 +1768,33 @@ def build_upkeep(r: dict, findings: list) -> dict:
             "UPKEEP_S": _worst(slot_s, "YELLOW" if cov else "GREEN", "YELLOW" if behind else "GREEN"), "SLOT_S": slot_s}
 
 
+def build_third_party(r: dict, findings: list) -> dict:
+    """Check 20: 3rd-party bookings at stores with no rate in the 3rd Party Info tab."""
+    days = r["meta"]["tp_days"]
+    rows = r["tp_rates"]
+    items: dict[tuple, list] = {}
+    for y in r.get("tp_rates_rows", []):
+        items.setdefault((y.pop("ticker"), y.pop("tag")), []).append(y)
+    for x in rows:
+        x["items"] = items.get((x["ticker"], x["tag"]), [])
+        x["fix"] =(f"Fill in {x['sheet_column']} on the {x['ticker']} row (row {x['sheet_row']})." if x["sheet_row"] else
+                    f"{x['ticker']} has no row in the tab. Add one, then fill in {x['sheet_column']}.")
+    stores = sorted({x["store"] for x in rows})
+    total = sum(x["bookings"] for x in rows)
+    if rows:
+        programs = list(dict.fromkeys(x["sheet_column"] for x in rows))
+        findings.append({
+            "sev": "YELLOW", "area": "3rd-party rates",
+            "finding": f"{_plural(total, '3rd-party booking')} at {_plural(len(stores), 'store')} "
+                       f"{'has' if total == 1 else 'have'} no rate in the 3rd Party Info tab (last {days} days): " + _list(programs, 4),
+            "detail": _list([f"{x['store']} {x['sheet_column']} ({x['bookings']})" for x in rows]),
+            "hint": "Add the store's rate in that program's column of 2024 LBS Keys, 3rd Party Info. Until then these bookings "
+                    "count at whatever the guest paid, usually full price or $0.",
+        })
+    return {"TP": {"days": days, "default": TP_DAYS_DEFAULT, "max": TP_DAYS_MAX, "cap": TP_ROWS_CAP, "rows": rows,
+                   "stores": len(stores), "bookings": total, "s": "YELLOW" if rows else "GREEN"}}
+
+
 def _stores(r: dict) -> list[dict]:
     """The 90-ish scope stores, TEG first then GBGS, from Check 10's rows."""
     seen = {}
@@ -1746,8 +1854,9 @@ def _summary(p: dict, findings: list) -> dict:
         {"name": f"Targets ({T['short']})", "s": T["s"], "v": f"{T['done']} / {len(TARGET_TYPES)} complete",
          "d": f"{T['partial']} partly loaded, {T['none']} not loaded. "
               + (f"{T['short']} 1 is {T['days_to']} days away" if T["days_to"] > 0 else f"{T['label']} has started")},
-        {"name": "Sheet upkeep", "s": p["UPKEEP_S"], "v": f"{slot0} stores, 0 slots" if slot0 else f"{cov_n} stores missing",
-         "d": f"{cov_n} stores missing from sheets, {behind} monthly sheets behind"},
+        {"name": "Sheet upkeep", "s": _worst(p["UPKEEP_S"], p["TP"]["s"]), "v": f"{slot0} stores, 0 slots" if slot0 else f"{cov_n} stores missing",
+         "d": f"{cov_n} stores missing from sheets, {behind} monthly sheets behind, "
+              f"{_plural(p['TP']['stores'], 'store')} missing 3rd-party rates"},
         {"name": "Reconciliation", "s": R["s"], "v": f"{R['last']:.3f}" if R["last"] is not None else "—",
          "d": (f"{'Within' if abs(R['drift']) <= 0.05 else 'Off by'} {abs(R['drift']) * 100:.1f} pts of 28-day avg ({R['last_trail']:.3f})"
                if R["drift"] is not None else "No overlapping days")},
@@ -1763,11 +1872,12 @@ SECTIONS = {
     "pipeline":    ["freshness", "lag"],
     "revenue":     ["network", "recon", "heatmap", "unknown", "coverage"],
     "reviews":     ["coverage", "map_problems", "unmapped_src", "unmapped_reviews"],
-    "nps":         ["unmapped_src", "unmapped_nps", "nps_weekly", "nps_valid", "nps_none", "coverage"],
+    "nps":         ["unmapped_src", "unmapped_nps", "unmapped_nps_rows", "nps_weekly", "nps_valid", "nps_none", "coverage"],
     "store_setup": ["sellers", "placeholders", "suggest"],
     "integrity":   ["bookings_int", "orphans", "agg_int", "sellers"],
     "targets":     ["targets", "target_orphans", "coverage"],
     "upkeep":      ["slots", "slot_mismatch", "sheet_cov", "monthly", "guest_care"],
+    "third_party": ["tp_rates", "tp_rates_rows"],
 }
 
 
@@ -1781,6 +1891,8 @@ def _build(r: dict, sections: list[str]) -> dict:
         p.update(build_store_setup(r, findings))
     if "upkeep" in sections:
         p.update(build_upkeep(r, findings))
+    if "third_party" in sections:
+        p.update(build_third_party(r, findings))
     if "reviews" in sections:
         p.update(build_reviews(r, findings))
     if "targets" in sections:
@@ -1816,13 +1928,13 @@ def get_default_dashboard() -> dict:
     return get_dashboard(None)
 
 
-def get_section(section: str, target_month: Optional[str] = None) -> dict:
+def get_section(section: str, target_month: Optional[str] = None, tp_days: int = TP_DAYS_DEFAULT) -> dict:
     if section not in SECTIONS:
         raise HTTPException(status_code=404, detail=f"Unknown section {section!r}; one of {', '.join(SECTIONS)}")
-    r = run_queries(SECTIONS[section], target_month)
+    r = run_queries(SECTIONS[section], target_month, tp_days)
     p = _build(r, [section])
     p["META"] = {"generated_at": r["meta"]["now_ct"], "today": r["meta"]["today"],
-                 "target_month": r["meta"]["target_month"], "query_seconds": r["_timings"]}
+                 "target_month": r["meta"]["target_month"], "tp_days": r["meta"]["tp_days"], "query_seconds": r["_timings"]}
     return p
 
 
@@ -1964,8 +2076,11 @@ def dashboard_route(target_month: Optional[str] = Query(None, pattern=r"^\d{4}-\
 
 
 @api.get("/api/data-health/checks/{section}")
-def section_route(section: str, target_month: Optional[str] = Query(None, pattern=r"^\d{4}-\d{2}$")):
-    return _guard(_memo, ("section", section, target_month), get_section, section, target_month)
+def section_route(section: str, target_month: Optional[str] = Query(None, pattern=r"^\d{4}-\d{2}$"),
+                  tp_days: int = Query(TP_DAYS_DEFAULT, ge=1, le=TP_DAYS_MAX)):
+    # The page's 3rd-party lookback picker calls /checks/third_party?tp_days=N
+    # (the full dashboard and its cache always use the 90-day default).
+    return _guard(_memo, ("section", section, target_month, tp_days), get_section, section, target_month, tp_days)
 
 
 app.include_router(api)
